@@ -5,11 +5,13 @@ use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
+    symbols::Marker,
     symbols::border,
     text::{Line, Span, Text},
     widgets::{
         Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
         ScrollbarState, Table, TableState, Wrap,
+        canvas::{Canvas, Map, MapResolution, Points},
     },
 };
 
@@ -31,11 +33,6 @@ const RED: Color = Color::Rgb(255, 60, 60);
 const WHITE: Color = Color::Rgb(210, 255, 210);
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const MATRIX_CHARS: &[char] = &[
-    'ｱ', 'ｲ', 'ｳ', 'ｴ', 'ｵ', 'ｶ', 'ｷ', 'ｸ', 'ｹ', 'ｺ', 'ｻ', 'ｼ', 'ｽ', 'ｾ', 'ｿ', 'ﾀ', 'ﾁ', 'ﾂ', 'ﾃ',
-    'ﾄ', 'ﾅ', 'ﾆ', 'ﾇ', 'ﾈ', 'ﾉ', '0', '1', '2', '3', '4', '5', '7', '8', '9', 'Z', ':', '=', '*',
-    '+', '<', '>', '|',
-];
 const BARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
 // The main logo, "RADIOGARDEN" in the figlet "ANSI Shadow" font.
@@ -175,18 +172,6 @@ fn hms(secs: u64) -> String {
     )
 }
 
-fn slug(s: &str) -> String {
-    let mut out = String::new();
-    for c in s.chars() {
-        if c.is_alphanumeric() {
-            out.extend(c.to_lowercase());
-        } else if !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    out.trim_matches('-').to_string()
-}
-
 fn volume_bar(volume: f32, width: usize) -> String {
     let filled = ((volume * width as f32).round() as usize).min(width);
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
@@ -264,7 +249,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     if chunks[0].height > 0 {
         render_banner(frame, app, chunks[0]);
     }
-    render_prompt(frame, app, chunks[1]);
+    render_breadcrumb(frame, app, chunks[1]);
     match app.screen {
         Screen::Places => render_places(frame, app, chunks[2]),
         Screen::Stations => render_stations(frame, app, chunks[2]),
@@ -357,43 +342,33 @@ fn render_banner(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(info), cols[1]);
 }
 
-fn render_prompt(frame: &mut Frame, app: &App, area: Rect) {
-    let path = match app.screen {
-        Screen::Places => "~/places".to_string(),
-        Screen::Stations => format!(
-            "~/places/{}",
-            app.current_place
-                .as_ref()
-                .map(|p| slug(&p.title))
-                .unwrap_or_default()
-        ),
-        Screen::Search => "~/search".to_string(),
-        Screen::NowPlaying => format!(
-            "~/tuner/{}",
+fn render_breadcrumb(frame: &mut Frame, app: &App, area: Rect) {
+    let place = |p: Option<&crate::app::PlaceSummary>| {
+        p.map(|p| p.title.to_uppercase()).unwrap_or_default()
+    };
+    let trail: Vec<String> = match app.screen {
+        Screen::Places => vec!["PLACES".into()],
+        Screen::Stations => vec!["PLACES".into(), place(app.current_place.as_ref())],
+        Screen::Search => vec!["SEARCH".into()],
+        Screen::NowPlaying => vec![
+            "TUNER".into(),
             app.now_playing
                 .as_ref()
-                .map(|p| slug(&p.title))
-                .unwrap_or_default()
-        ),
-    };
-    let cmd = match app.screen {
-        Screen::Places => "ls --sort=stations".to_string(),
-        Screen::Stations => "ls ./stations".to_string(),
-        Screen::Search => format!("grep -i \"{}\"", app.search_input),
-        Screen::NowPlaying => "tail -f /dev/radio".to_string(),
+                .map(|s| s.title.to_uppercase())
+                .unwrap_or_default(),
+        ],
     };
 
-    let mut left = vec![
-        Span::styled(" root", bold(GREEN)),
-        Span::styled("@", s(DIM)),
-        Span::styled("garden", bold(GREEN)),
-        Span::styled(":", s(DIM)),
-        Span::styled(path, bold(CYAN)),
-        Span::styled("$ ", s(DIM)),
-        Span::styled(cmd, s(WHITE)),
-    ];
-    if blink(app) {
-        left.push(Span::styled("▌", s(GREEN)));
+    let mut left = vec![Span::styled(" ◉ ", bold(GREEN))];
+    let last = trail.len().saturating_sub(1);
+    for (i, part) in trail.into_iter().enumerate() {
+        if i > 0 {
+            left.push(Span::styled(" ▸ ", s(DARK)));
+        }
+        left.push(Span::styled(
+            part,
+            if i == last { bold(GREEN) } else { s(DIM) },
+        ));
     }
 
     let right = match &app.loading {
@@ -416,6 +391,83 @@ fn render_prompt(frame: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().bg(BG_ALT)),
         cols[1],
     );
+}
+
+// ---------------------------------------------------------------------------
+// world map
+// ---------------------------------------------------------------------------
+
+/// Lists get a world map beside them when the terminal is at least this wide.
+const MAP_BESIDE_LIST_WIDTH: u16 = 120;
+
+fn lat_lon_label((lon, lat): (f64, f64)) -> String {
+    format!(
+        "{:.2}°{} {:.2}°{}",
+        lat.abs(),
+        if lat >= 0.0 { 'N' } else { 'S' },
+        lon.abs(),
+        if lon >= 0.0 { 'E' } else { 'W' }
+    )
+}
+
+/// Braille world map with every known place as a dot and a blinking marker
+/// at `target` (lon, lat).
+fn render_world(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    target: Option<(f64, f64)>,
+    label: Option<&str>,
+) {
+    let title = match target {
+        Some(t) => format!("WORLD // {}", lat_lon_label(t)),
+        None => "WORLD".to_string(),
+    };
+    let pulse = blink(app);
+    let canvas = Canvas::default()
+        .block(panel(title, false))
+        .background_color(BG)
+        .marker(Marker::Braille)
+        .x_bounds([-180.0, 180.0])
+        .y_bounds([-90.0, 90.0])
+        .paint(|ctx| {
+            ctx.draw(&Map {
+                color: DARK,
+                resolution: MapResolution::High,
+            });
+            ctx.layer();
+            ctx.draw(&Points {
+                coords: &app.place_points,
+                color: DIM,
+            });
+            if let Some((lon, lat)) = target {
+                ctx.layer();
+                let marker = if pulse { "◉" } else { "○" };
+                ctx.print(lon, lat, Span::styled(marker, bold(AMBER)));
+                if let Some(label) = label {
+                    // Put the label on whichever side has more room.
+                    let x = if lon < 60.0 {
+                        lon + 6.0
+                    } else {
+                        lon - 6.0 - label.chars().count() as f64 * 4.0
+                    };
+                    ctx.print(x, lat, Span::styled(label.to_string(), bold(WHITE)));
+                }
+            }
+        });
+    frame.render_widget(canvas, area);
+}
+
+/// Split `area` into (list, map) when there's room for a map beside the list.
+fn with_map(area: Rect) -> (Rect, Option<Rect>) {
+    if area.width < MAP_BESIDE_LIST_WIDTH {
+        return (area, None);
+    }
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(area);
+    (cols[0], Some(cols[1]))
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +561,14 @@ fn loading_text<'a>(app: &App, what: &str) -> Text<'a> {
 }
 
 fn render_places(frame: &mut Frame, app: &App, area: Rect) {
+    let (area, map) = with_map(area);
+    if let Some(map) = map {
+        let label = app
+            .places
+            .get(app.places_state.selected)
+            .map(|p| p.title.as_str());
+        render_world(frame, app, map, app.selected_place_coords(), label);
+    }
     let st = &app.places_state;
     let rows = app.places[visible(st)]
         .iter()
@@ -556,6 +616,12 @@ fn render_places(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_stations(frame: &mut Frame, app: &App, area: Rect) {
+    let (area, map) = with_map(area);
+    if let Some(map) = map {
+        let place = app.current_place.as_ref();
+        let coords = place.and_then(|p| app.place_coords(&p.id));
+        render_world(frame, app, map, coords, place.map(|p| p.title.as_str()));
+    }
     let st = &app.channels_state;
     let playing_id = app
         .now_playing
@@ -701,15 +767,16 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
 fn render_now_playing(frame: &mut Frame, app: &App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(10), Constraint::Min(3)])
+        .constraints([Constraint::Percentage(65), Constraint::Min(4)])
         .split(area);
     let top = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(rows[0]);
 
     render_signal_info(frame, app, top[0]);
-    render_matrix(frame, app, top[1]);
+    let label = app.now_playing.as_ref().map(|s| s.title.as_str());
+    render_world(frame, app, top[1], app.now_playing_coords(), label);
     render_spectrum(frame, app, rows[1]);
 }
 
@@ -720,6 +787,26 @@ fn kv<'a>(key: &'a str, value: Span<'a>) -> Line<'a> {
         Span::styled(": ", s(DARK)),
         value,
     ])
+}
+
+fn buffer_span(app: &App, width: usize) -> Span<'static> {
+    match app.buffer {
+        Some(b) if b.capacity_seconds > 0.0 => {
+            let fill = (b.seconds / b.capacity_seconds).clamp(0.0, 1.0);
+            let color = if fill < 0.2 { AMBER } else { MID };
+            Span::styled(
+                format!(
+                    "{} {:>4.1}s / {:.0}s @ {} kbps",
+                    volume_bar(fill, width),
+                    b.seconds,
+                    b.capacity_seconds,
+                    b.kbps
+                ),
+                s(color),
+            )
+        }
+        _ => Span::styled("—", s(DARK)),
+    }
 }
 
 fn render_signal_info(frame: &mut Frame, app: &App, area: Rect) {
@@ -771,56 +858,13 @@ fn render_signal_info(frame: &mut Frame, app: &App, area: Rect) {
                 s(DIM),
             ),
         ),
+        kv("buffer", buffer_span(app, 20)),
         kv(
             "node",
             Span::styled(format!("rg://{}", station.channel_id), s(DIM)),
         ),
     ];
     frame.render_widget(Paragraph::new(lines).block(panel("SIGNAL", true)), area);
-}
-
-/// Falling-glyph "digital rain". Freezes when nothing is playing.
-fn render_matrix(frame: &mut Frame, app: &App, area: Rect) {
-    let block = panel("CARRIER", false);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let (w, h) = (inner.width as usize, inner.height as usize);
-    if w == 0 || h == 0 {
-        return;
-    }
-    let live = app.playback == Playback::Playing;
-    let t = if live { app.tick } else { 0 };
-
-    // Half-width katakana are single cells, so one column per glyph.
-    let lines: Vec<Line> = (0..h)
-        .map(|y| {
-            let spans: Vec<Span> = (0..w)
-                .map(|x| {
-                    let seed = hash(x as u64, 7);
-                    let speed = 1 + seed % 3;
-                    let trail = 4 + (seed >> 8) as usize % 8;
-                    let cycle = h + trail + (seed >> 16) as usize % 10;
-                    let head = ((t * speed / 2) as usize + (seed >> 24) as usize) % cycle;
-                    let dist = head as isize - y as isize;
-                    if !live || dist < 0 || dist as usize > trail {
-                        return Span::raw(" ");
-                    }
-                    let glyph = MATRIX_CHARS
-                        [(hash(x as u64, (y as u64) ^ (t / 3)) as usize) % MATRIX_CHARS.len()];
-                    let style = match dist {
-                        0 => bold(WHITE),
-                        1..=2 => bold(GREEN),
-                        d if (d as usize) < trail / 2 => s(MID),
-                        _ => s(DARK),
-                    };
-                    Span::styled(glyph.to_string(), style)
-                })
-                .collect();
-            Line::from(spans)
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// A (simulated) spectrum analyser: smooth pseudo-random bands scaled by the
@@ -913,7 +957,12 @@ fn render_player_bar(frame: &mut Frame, app: &App, area: Rect) {
         )),
     }
 
+    let buf = app
+        .buffer
+        .map(|b| format!("buf {:>2.0}s  ", b.seconds))
+        .unwrap_or_default();
     let right = Line::from(vec![
+        Span::styled(buf, s(DIM)),
         Span::styled(format!("{} ", hms(app.elapsed_secs())), s(AMBER)),
         Span::styled("vol ", s(DIM)),
         Span::styled(volume_bar(app.volume, 10), s(MID)),
@@ -1070,12 +1119,6 @@ mod tests {
     }
 
     #[test]
-    fn slug_formats_paths() {
-        assert_eq!(slug("Austin TX"), "austin-tx");
-        assert_eq!(slug("KUTX FM 98.9"), "kutx-fm-98-9");
-    }
-
-    #[test]
     fn list_rows_accounts_for_chrome() {
         assert!(list_rows(40, Screen::Places) > list_rows(40, Screen::Search));
         assert_eq!(list_rows(3, Screen::Places), 1, "never zero");
@@ -1129,7 +1172,7 @@ mod tests {
         app.set_list_height(list_rows(40, Screen::Places));
         let out = draw(&app, 120, 40);
         assert!(out.contains("Place 49"), "busiest place first");
-        assert!(out.contains("root@garden"));
+        assert!(out.contains("PLACES"));
     }
 
     #[test]
