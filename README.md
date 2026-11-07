@@ -15,7 +15,8 @@ Live radio from around the planet, in your terminal. A TUI client for
 - Browse ~13,000 places, busiest first.
 - Fuzzy-grep places locally as you type, or search stations on radio.garden.
 - Stream MP3 / AAC / OGG / FLAC, including stations behind redirect chains and `.pls`/`.m3u` playlists.
-- Phosphor-green hacker UI with an ANSI Shadow logo, a tuner bar, a spectrum display and digital rain.
+- Phosphor-green hacker UI with an ANSI Shadow logo, a world map that marks where the station is, a tuner bar and a spectrum display.
+- Holds at most 15 seconds of audio in memory, sized from the station's bitrate.
 
 ## Install & run
 
@@ -58,13 +59,14 @@ error instead of crashing.
 If a station won't play, probe it without the UI:
 
 ```bash
-cargo run -- --probe <channel_id>
+cargo run -- --probe <channel_id> [seconds]
 ```
 
 The channel id is the last segment of a station URL, e.g. `vbFsCngB` in
 `radio.garden/listen/kutx-fm-98-9/vbFsCngB`. The probe prints the final
 stream URL after all redirects, the content type and each player state, then
-plays for 8 seconds.
+plays for 8 seconds (or the number you give), printing the buffer level every
+2 seconds.
 
 HLS (`.m3u8` segment) streams are not supported yet.
 
