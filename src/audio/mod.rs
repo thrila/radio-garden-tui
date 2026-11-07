@@ -10,11 +10,12 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, mixer::Mixer};
 use tokio::sync::mpsc;
 
+use crate::budget::ByteBudget;
 use crate::error::{RadioError, Result};
 
 /// Bytes buffered before playback starts, to smooth over network jitter
@@ -24,10 +25,40 @@ pub const PREBUFFER_BYTES: usize = 32 * 1024;
 /// after this long.
 pub const PREBUFFER_MAX_WAIT: Duration = Duration::from_millis(2500);
 
+/// Most audio held in memory between the network and the decoder.
+pub const BUFFER_SECONDS: f32 = 15.0;
+const MIN_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// Assumed until the real bitrate is known.
+const DEFAULT_KBPS: u32 = 128;
+/// Ignore the startup burst (prebuffer + decoder probing) when measuring.
+const MEASURE_AFTER: Duration = Duration::from_secs(3);
+const MEASURE_EVERY: Duration = Duration::from_secs(5);
+
+/// Bytes that hold `BUFFER_SECONDS` of audio at `kbps`.
+pub fn buffer_bytes(kbps: u32) -> usize {
+    let bytes_per_sec = kbps as f32 * 1000.0 / 8.0;
+    ((bytes_per_sec * BUFFER_SECONDS) as usize).clamp(MIN_BUFFER_BYTES, MAX_BUFFER_BYTES)
+}
+
+/// Bitrate implied by the decoder consuming `bytes` over `elapsed`.
+/// Playback runs in real time, so this is the stream's actual bitrate.
+fn measured_kbps(bytes: u64, elapsed: Duration) -> Option<u32> {
+    let secs = elapsed.as_secs_f64();
+    if secs < 1.0 || bytes == 0 {
+        return None;
+    }
+    let kbps = (bytes as f64 * 8.0 / 1000.0 / secs).round() as u32;
+    (8..=2_000).contains(&kbps).then_some(kbps)
+}
+
 /// A live byte stream handed to the player.
 pub struct StreamSource {
     pub content_type: Option<String>,
-    pub chunks: mpsc::Receiver<Vec<u8>>,
+    pub bitrate_kbps: Option<u32>,
+    pub chunks: mpsc::UnboundedReceiver<Vec<u8>>,
+    /// Shared with the network reader; caps buffered bytes.
+    pub budget: ByteBudget,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,6 +67,12 @@ pub enum PlayerState {
     Playing,
     Ended,
     Error(String),
+    /// Periodic buffer report while playing; doesn't change the play state.
+    Buffer {
+        seconds: f32,
+        capacity_seconds: f32,
+        kbps: u32,
+    },
 }
 
 /// Status update for the playback session started by `Player::play` with the
@@ -60,18 +97,30 @@ pub trait Player {
 
 /// Adapts a channel of byte chunks into a blocking, forward-only `Read`.
 /// Must only be read from a non-async thread (decoder / audio callback).
+/// Dropping it closes the budget, which stops the network reader.
 struct ChunkReader {
-    rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+    rx: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
+    budget: ByteBudget,
     buf: VecDeque<u8>,
     pos: u64,
+    /// Bytes handed to the decoder so far, for bitrate measurement.
+    consumed: Arc<AtomicU64>,
+}
+
+impl Drop for ChunkReader {
+    fn drop(&mut self) {
+        self.budget.close();
+    }
 }
 
 impl ChunkReader {
-    fn new(rx: mpsc::Receiver<Vec<u8>>) -> Self {
+    fn new(rx: mpsc::UnboundedReceiver<Vec<u8>>, budget: ByteBudget) -> Self {
         Self {
             rx: Mutex::new(rx),
+            budget,
             buf: VecDeque::with_capacity(PREBUFFER_BYTES),
             pos: 0,
+            consumed: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -83,6 +132,7 @@ impl ChunkReader {
         };
         match next {
             Some(chunk) => {
+                self.budget.release(chunk.len());
                 self.buf.extend(chunk);
                 true
             }
@@ -115,6 +165,7 @@ impl Read for ChunkReader {
             *dst = src;
         }
         self.pos += n as u64;
+        self.consumed.store(self.pos, Ordering::Relaxed);
         Ok(n)
     }
 }
@@ -206,7 +257,12 @@ impl Player for RodioPlayer {
         std::thread::spawn(move || {
             emit(PlayerState::Buffering);
 
-            let mut reader = ChunkReader::new(source.chunks);
+            let budget = source.budget.clone();
+            let mut kbps = source.bitrate_kbps.unwrap_or(DEFAULT_KBPS);
+            budget.resize(buffer_bytes(kbps));
+
+            let mut reader = ChunkReader::new(source.chunks, source.budget);
+            let consumed = reader.consumed.clone();
             let started = std::time::Instant::now();
             reader.prefill(PREBUFFER_BYTES, || {
                 is_current() && started.elapsed() < PREBUFFER_MAX_WAIT
@@ -251,12 +307,45 @@ impl Player for RodioPlayer {
             }
             emit(PlayerState::Playing);
 
-            // Watch for the stream ending (server closed / decode failure).
+            // Watch the buffer and for the stream ending (server closed /
+            // decode failure). Without an advertised bitrate, measure it from
+            // the decoder's real-time consumption and resize the buffer.
+            let playing_since = Instant::now();
+            let mut sample: Option<(Instant, u64)> = None;
+            let mut ticks: u64 = 0;
             loop {
                 std::thread::sleep(Duration::from_millis(250));
                 if !is_current() {
                     return;
                 }
+                ticks += 1;
+
+                if source.bitrate_kbps.is_none() && playing_since.elapsed() >= MEASURE_AFTER {
+                    let now = (Instant::now(), consumed.load(Ordering::Relaxed));
+                    match sample {
+                        None => sample = Some(now),
+                        Some((t0, b0)) if now.0 - t0 >= MEASURE_EVERY => {
+                            if let Some(m) = measured_kbps(now.1.saturating_sub(b0), now.0 - t0)
+                                && m.abs_diff(kbps) * 10 > kbps
+                            {
+                                kbps = m;
+                                budget.resize(buffer_bytes(kbps));
+                            }
+                            sample = Some(now);
+                        }
+                        Some(_) => {}
+                    }
+                }
+
+                if ticks.is_multiple_of(2) {
+                    let bytes_per_sec = kbps as f32 * 125.0;
+                    emit(PlayerState::Buffer {
+                        seconds: budget.buffered() as f32 / bytes_per_sec,
+                        capacity_seconds: budget.capacity() as f32 / bytes_per_sec,
+                        kbps,
+                    });
+                }
+
                 let ended = shared
                     .lock()
                     .map(|g| g.current.as_ref().is_none_or(|p| p.empty()))
@@ -326,13 +415,64 @@ impl Player for NullPlayer {
 mod tests {
     use super::*;
 
-    fn reader_with(chunks: &[&[u8]], close: bool) -> (ChunkReader, Option<mpsc::Sender<Vec<u8>>>) {
-        let (tx, rx) = mpsc::channel(64);
+    fn reader_with(
+        chunks: &[&[u8]],
+        close: bool,
+    ) -> (ChunkReader, Option<mpsc::UnboundedSender<Vec<u8>>>) {
+        let (tx, rx) = mpsc::unbounded_channel();
         for c in chunks {
-            tx.try_send(c.to_vec()).unwrap();
+            tx.send(c.to_vec()).unwrap();
         }
         let tx = if close { None } else { Some(tx) };
-        (ChunkReader::new(rx), tx)
+        (ChunkReader::new(rx, ByteBudget::new(1 << 20)), tx)
+    }
+
+    fn source() -> StreamSource {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        StreamSource {
+            content_type: None,
+            bitrate_kbps: None,
+            chunks: rx,
+            budget: ByteBudget::new(1024),
+        }
+    }
+
+    #[test]
+    fn buffer_holds_fixed_seconds() {
+        // 128 kbps = 16 KB/s -> 15 s = 240 KB
+        assert_eq!(buffer_bytes(128), 240_000);
+        assert_eq!(buffer_bytes(320), 600_000);
+        assert_eq!(buffer_bytes(8), MIN_BUFFER_BYTES, "clamped low");
+        assert_eq!(buffer_bytes(1_000_000), MAX_BUFFER_BYTES, "clamped high");
+    }
+
+    #[test]
+    fn measures_bitrate_from_consumption() {
+        assert_eq!(measured_kbps(80_000, Duration::from_secs(10)), Some(64));
+        assert_eq!(measured_kbps(160_000, Duration::from_secs(10)), Some(128));
+        assert_eq!(measured_kbps(1, Duration::from_millis(10)), None);
+        assert_eq!(measured_kbps(0, Duration::from_secs(10)), None);
+    }
+
+    #[test]
+    fn reader_returns_budget_and_closes_it_on_drop() {
+        let budget = ByteBudget::new(100);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert!(rt.block_on(budget.acquire(10)));
+        tx.send(vec![0u8; 10]).unwrap();
+        assert_eq!(budget.buffered(), 10);
+
+        let mut r = ChunkReader::new(rx, budget.clone());
+        let mut out = [0u8; 10];
+        r.read_exact(&mut out).unwrap();
+        assert_eq!(budget.buffered(), 0, "bytes handed back as consumed");
+        assert_eq!(r.consumed.load(Ordering::Relaxed), 10);
+
+        drop(r);
+        assert!(!rt.block_on(budget.acquire(1)), "producer told to stop");
     }
 
     #[test]
@@ -356,11 +496,11 @@ mod tests {
 
     #[test]
     fn read_waits_for_late_data() {
-        let (tx, rx) = mpsc::channel(4);
-        let mut r = ChunkReader::new(rx);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut r = ChunkReader::new(rx, ByteBudget::new(1024));
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
-            tx.blocking_send(b"late".to_vec()).unwrap();
+            tx.send(b"late".to_vec()).unwrap();
         });
         let mut out = [0u8; 4];
         assert_eq!(r.read(&mut out).unwrap(), 4);
@@ -427,16 +567,8 @@ mod tests {
     #[test]
     fn fake_player_sessions_increase() {
         let mut p = FakePlayer::default();
-        let (_tx, rx) = mpsc::channel(1);
-        let a = p.play(StreamSource {
-            content_type: None,
-            chunks: rx,
-        });
-        let (_tx, rx) = mpsc::channel(1);
-        let b = p.play(StreamSource {
-            content_type: None,
-            chunks: rx,
-        });
+        let a = p.play(source());
+        let b = p.play(source());
         assert!(b > a);
         p.set_volume(0.3);
         p.stop();
@@ -448,11 +580,7 @@ mod tests {
     fn null_player_reports_error() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut p = NullPlayer::new("no device".into(), tx);
-        let (_ctx, crx) = mpsc::channel(1);
-        let id = p.play(StreamSource {
-            content_type: None,
-            chunks: crx,
-        });
+        let id = p.play(source());
         let ev = rx.try_recv().unwrap();
         assert_eq!(ev.session, id);
         assert_eq!(ev.state, PlayerState::Error("no device".into()));
