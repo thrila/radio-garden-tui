@@ -2,6 +2,7 @@
 //! presses mutate state and may return a [`Command`] that `main` executes
 //! (API calls, audio). Results come back through the `on_*` methods.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -64,6 +65,14 @@ impl Playback {
             Playback::Connecting | Playback::Buffering | Playback::Playing
         )
     }
+}
+
+/// Latest buffer report from the player.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BufferInfo {
+    pub seconds: f32,
+    pub capacity_seconds: f32,
+    pub kbps: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -187,6 +196,9 @@ pub struct App {
     pub return_screen: Screen,
 
     pub places: Vec<Place>,
+    /// `(lon, lat)` of every place, for the world map.
+    pub place_points: Vec<(f64, f64)>,
+    place_index: HashMap<String, usize>,
     pub places_state: ListState,
     pub places_loaded: bool,
 
@@ -205,6 +217,7 @@ pub struct App {
     pub stream_url: Option<String>,
     pub playback: Playback,
     pub playing_since: Option<Instant>,
+    pub buffer: Option<BufferInfo>,
     play_request: u64,
     player_session: Option<u64>,
 
@@ -228,6 +241,8 @@ impl App {
             screen: Screen::Places,
             return_screen: Screen::Places,
             places: Vec::new(),
+            place_points: Vec::new(),
+            place_index: HashMap::new(),
             places_state: ListState::default(),
             places_loaded: false,
             current_place: None,
@@ -243,6 +258,7 @@ impl App {
             stream_url: None,
             playback: Playback::Idle,
             playing_since: None,
+            buffer: None,
             play_request: 0,
             player_session: None,
             volume: 0.6,
@@ -263,6 +279,12 @@ impl App {
         // Busiest places first: much nicer to browse than API order.
         places.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.title.cmp(&b.title)));
         self.places_state.reset(places.len());
+        self.place_points = places.iter().filter_map(place_lon_lat).collect();
+        self.place_index = places
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.id.clone(), i))
+            .collect();
         self.places = places;
         self.places_loaded = true;
     }
@@ -297,6 +319,26 @@ impl App {
         (self.seed.wrapping_mul(0x2545_F491_4F6C_DD1D) % n.max(1) as u64) as usize
     }
 
+    /// `(lon, lat)` of a place by id, if it's in the index.
+    pub fn place_coords(&self, place_id: &str) -> Option<(f64, f64)> {
+        let i = *self.place_index.get(place_id)?;
+        place_lon_lat(self.places.get(i)?)
+    }
+
+    /// Where the tuned station is: its own place, else the open place.
+    pub fn now_playing_coords(&self) -> Option<(f64, f64)> {
+        self.now_playing
+            .as_ref()
+            .and_then(|s| s.place.as_ref())
+            .and_then(|p| self.place_coords(&p.id))
+            .or_else(|| self.place_coords(&self.current_place.as_ref()?.id))
+    }
+
+    /// The place under the cursor on the places screen.
+    pub fn selected_place_coords(&self) -> Option<(f64, f64)> {
+        place_lon_lat(self.places.get(self.places_state.selected)?)
+    }
+
     pub fn elapsed_secs(&self) -> u64 {
         match (&self.playback, self.playing_since) {
             (Playback::Playing, Some(t)) => t.elapsed().as_secs(),
@@ -324,6 +366,7 @@ impl App {
         self.stream_url = None;
         self.playback = Playback::Connecting;
         self.playing_since = None;
+        self.buffer = None;
         self.notice = None;
         if self.screen != Screen::NowPlaying {
             self.return_screen = self.screen;
@@ -341,6 +384,7 @@ impl App {
             self.player_session = None;
             self.playback = Playback::Stopped;
             self.playing_since = None;
+            self.buffer = None;
             Some(Command::Stop)
         } else {
             let station = self.now_playing.clone()?;
@@ -637,18 +681,43 @@ impl App {
             return;
         }
         self.playback = match event.state {
+            PlayerState::Buffer {
+                seconds,
+                capacity_seconds,
+                kbps,
+            } => {
+                self.buffer = Some(BufferInfo {
+                    seconds,
+                    capacity_seconds,
+                    kbps,
+                });
+                return;
+            }
             PlayerState::Buffering => Playback::Buffering,
             PlayerState::Playing => {
                 self.playing_since = Some(Instant::now());
                 Playback::Playing
             }
-            PlayerState::Ended => Playback::Ended,
-            PlayerState::Error(e) => Playback::Error(e),
+            PlayerState::Ended => {
+                self.buffer = None;
+                Playback::Ended
+            }
+            PlayerState::Error(e) => {
+                self.buffer = None;
+                Playback::Error(e)
+            }
         };
     }
 
     pub fn on_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+    }
+}
+
+fn place_lon_lat(p: &Place) -> Option<(f64, f64)> {
+    match p.geo.as_slice() {
+        [lon, lat, ..] if lon.is_finite() && lat.is_finite() => Some((*lon, *lat)),
+        _ => None,
     }
 }
 
@@ -903,6 +972,57 @@ mod tests {
             state: PlayerState::Playing,
         });
         assert_eq!(app.playback, Playback::Playing);
+    }
+
+    #[test]
+    fn station_coords_follow_its_place() {
+        let mut app = App::new();
+        let mut austin = place(0, "Austin TX", "United States", 21);
+        austin.geo = vec![-97.74, 30.27];
+        let mut lagos = place(1, "Lagos", "Nigeria", 50);
+        lagos.geo = vec![3.38, 6.52];
+        app.set_places(vec![austin, lagos]);
+        assert_eq!(app.place_points.len(), 2);
+
+        let mut s = station(0);
+        s.place = Some(crate::api::PlaceRef {
+            id: "id1".into(),
+            title: "Lagos".into(),
+        });
+        app.now_playing = Some(s);
+        assert_eq!(app.now_playing_coords(), Some((3.38, 6.52)));
+
+        app.now_playing.as_mut().unwrap().place = None;
+        assert_eq!(app.now_playing_coords(), None, "no place, none open");
+        assert_eq!(
+            app.selected_place_coords(),
+            Some((3.38, 6.52)),
+            "Lagos sorts first"
+        );
+    }
+
+    #[test]
+    fn buffer_reports_dont_change_playback_state() {
+        let mut app = app_on_stations(1);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.on_stream_opened(1, Ok("u".into())));
+        app.on_player_started(3);
+        app.on_player_event(PlayerEvent {
+            session: 3,
+            state: PlayerState::Playing,
+        });
+        app.on_player_event(PlayerEvent {
+            session: 3,
+            state: PlayerState::Buffer {
+                seconds: 9.5,
+                capacity_seconds: 15.0,
+                kbps: 128,
+            },
+        });
+        assert_eq!(app.playback, Playback::Playing);
+        assert_eq!(app.buffer.map(|b| b.kbps), Some(128));
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.buffer.is_none(), "cleared on stop");
     }
 
     #[test]
