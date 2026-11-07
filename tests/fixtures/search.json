@@ -1,0 +1,5 @@
+{"took":3,"query":"london","hits":{"hits":[
+{"_source":{"code":"GB","page":{"map":"0eZoYyEW","url":"/visit/london/0eZoYyEW","type":"page","count":374,"title":"London","subtitle":"United Kingdom"},"type":"place"},"_score":1},
+{"_source":{"code":"GB","page":{"url":"/listen/lbc/e8CURqFY","type":"channel","place":{"id":"0eZoYyEW","title":"London"},"title":"LBC London","secure":true,"country":{"id":"jm6Gyxm7","title":"United Kingdom"},"preroll":false,"subtitle":"London, United Kingdom","stream":"musicradio.com"},"type":"channel"},"_score":0.9},
+{"_source":{"code":"GB","page":{"url":"/visit/united-kingdom/jm6Gyxm7","type":"page","title":"United Kingdom"},"type":"country"},"_score":0.5}
+]}}

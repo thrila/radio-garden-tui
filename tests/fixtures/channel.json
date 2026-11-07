@@ -1,0 +1,19 @@
+{
+  "apiVersion": 1,
+  "version": "78c9736",
+  "data": {
+    "id": "vbFsCngB",
+    "title": "KUTX FM 98.9",
+    "url": "/listen/kutx-fm-98-9/vbFsCngB",
+    "website": "https://kutx.org",
+    "secure": true,
+    "place": {
+      "id": "Aq7xeIiB",
+      "title": "Austin TX"
+    },
+    "country": {
+      "id": "GhDXw4EW",
+      "title": "United States"
+    }
+  }
+}

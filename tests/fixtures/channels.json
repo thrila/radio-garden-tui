@@ -1,0 +1,50 @@
+{
+  "apiVersion": 1,
+  "version": "78c9736",
+  "data": {
+    "title": "Austin TX",
+    "subtitle": "All Stations",
+    "url": "/visit/austin-tx/Aq7xeIiB/channels",
+    "map": "Aq7xeIiB",
+    "count": 27,
+    "utcOffset": -300,
+    "content": [
+      {
+        "itemsType": "channel",
+        "type": "list",
+        "items": [
+          {
+            "page": {
+              "url": "/listen/kutx-fm-98-9/vbFsCngB",
+              "type": "channel",
+              "title": "KUTX FM 98.9",
+              "secure": true,
+              "website": "https://kutx.org",
+              "stream": "kut.org"
+            }
+          },
+          {
+            "page": {
+              "url": "/listen/kut-90-5-fm/mfnMeV9N",
+              "type": "channel",
+              "title": "KUT 90.5 FM",
+              "secure": true,
+              "website": "http://kut.org",
+              "stream": "kut.org"
+            }
+          },
+          {
+            "page": {
+              "url": "/listen/kmfa/g72kAOBD",
+              "type": "channel",
+              "title": "KMFA FM 89.5",
+              "secure": true,
+              "website": "https://www.kmfa.org",
+              "stream": "streamguys1.com"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

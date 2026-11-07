@@ -1,0 +1,36 @@
+{
+  "apiVersion": 1,
+  "version": "78c9736",
+  "data": {
+    "list": [
+      {
+        "id": "Aq7xeIiB",
+        "geo": [-97.74306, 30.267153],
+        "url": "/visit/austin-tx/Aq7xeIiB",
+        "size": 21,
+        "boost": true,
+        "title": "Austin TX",
+        "country": "United States"
+      },
+      {
+        "id": "CG2XUaNl",
+        "geo": [1.1498, 41.7241],
+        "url": "/visit/tarrega/CG2XUaNl",
+        "size": 3,
+        "boost": false,
+        "title": "Tàrrega",
+        "country": "Spain"
+      },
+      {
+        "id": "VGGTrBP9",
+        "geo": [99.9433, 8.4326],
+        "url": "/visit/nakorn-si-thammarat/VGGTrBP9",
+        "size": 1,
+        "boost": false,
+        "title": "Nakhon Si Thammarat",
+        "country": "Thailand"
+      }
+    ],
+    "version": "78c9736"
+  }
+}
