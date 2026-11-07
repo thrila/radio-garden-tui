@@ -1,6 +1,7 @@
 mod api;
 mod app;
 mod audio;
+mod budget;
 mod cache;
 mod error;
 mod event;
@@ -37,7 +38,8 @@ async fn main() -> anyhow::Result<()> {
     if let [flag, channel_id, ..] = args.as_slice()
         && flag == "--probe"
     {
-        return probe(&api, channel_id).await;
+        let secs = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
+        return probe(&api, channel_id, secs).await;
     }
 
     let mut app = App::new();
@@ -160,7 +162,9 @@ async fn run(
                     if app.on_stream_opened(request, Ok(stream.url.clone())) {
                         let session = player.play(StreamSource {
                             content_type: stream.content_type,
+                            bitrate_kbps: stream.bitrate_kbps,
                             chunks: stream.chunks,
+                            budget: stream.budget,
                         });
                         app.on_player_started(session);
                     }
@@ -217,10 +221,10 @@ fn execute(
     true
 }
 
-/// `radio_tui --probe <channel_id>`: resolve and play a station for a few
-/// seconds without the TUI, printing each step. Handy for diagnosing a
-/// station that won't play.
-async fn probe(api: &ApiClient, channel_id: &str) -> anyhow::Result<()> {
+/// `radio_tui --probe <channel_id> [seconds]`: resolve and play a station
+/// without the TUI, printing each step. Handy for diagnosing a station that
+/// won't play.
+async fn probe(api: &ApiClient, channel_id: &str, secs: u64) -> anyhow::Result<()> {
     println!("[probe] listen url: {}", ApiClient::listen_url(channel_id));
     let stream = api.open_stream(channel_id).await?;
     println!(
@@ -228,24 +232,40 @@ async fn probe(api: &ApiClient, channel_id: &str) -> anyhow::Result<()> {
         stream.url,
         stream.content_type.as_deref().unwrap_or("no content-type")
     );
+    match stream.bitrate_kbps {
+        Some(kbps) => println!("[probe] bitrate:    {kbps} kbps (advertised)"),
+        None => println!("[probe] bitrate:    not advertised, will measure"),
+    }
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut player = RodioPlayer::new(tx, 0.4)?;
     player.play(StreamSource {
         content_type: stream.content_type,
+        bitrate_kbps: stream.bitrate_kbps,
         chunks: stream.chunks,
+        budget: stream.budget,
     });
 
-    let deadline = tokio::time::sleep(Duration::from_secs(8));
+    let deadline = tokio::time::sleep(Duration::from_secs(secs));
     tokio::pin!(deadline);
+    let mut reports = 0u32;
     loop {
         tokio::select! {
             _ = &mut deadline => {
-                println!("[probe] still playing after 8s: OK");
+                println!("[probe] still playing after {secs}s: OK");
                 break;
             }
             ev = rx.recv() => match ev {
                 Some(ev) => {
+                    if let audio::PlayerState::Buffer { seconds, capacity_seconds, kbps } = ev.state {
+                        reports += 1;
+                        if reports.is_multiple_of(4) {
+                            println!(
+                                "[probe] buffer:     {seconds:>4.1}s / {capacity_seconds:.0}s @ {kbps} kbps"
+                            );
+                        }
+                        continue;
+                    }
                     println!("[probe] player:     {:?}", ev.state);
                     if matches!(ev.state, audio::PlayerState::Error(_) | audio::PlayerState::Ended) {
                         anyhow::bail!("playback failed");
