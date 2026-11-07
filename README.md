@@ -1,10 +1,12 @@
 # radio_tui
 
 ```
-  ___    _    ___   ___   ___      ___    _    ___  ___   ___  _  _
- | _ \  /_\  |   \ |_ _| / _ \    / __|  /_\  | _ \|   \ | __|| \| |
- |   / / _ \ | |) | | | | (_) |  | (_ | / _ \ |   /| |) || _| | .` |
- |_|_\/_/ \_\|___/ |___| \___/    \___|/_/ \_\|_|_\|___/ |___||_|\_|
+██████╗  █████╗ ██████╗ ██╗ ██████╗  ██████╗  █████╗ ██████╗ ██████╗ ███████╗███╗   ██╗
+██╔══██╗██╔══██╗██╔══██╗██║██╔═══██╗██╔════╝ ██╔══██╗██╔══██╗██╔══██╗██╔════╝████╗  ██║
+██████╔╝███████║██║  ██║██║██║   ██║██║  ███╗███████║██████╔╝██║  ██║█████╗  ██╔██╗ ██║
+██╔══██╗██╔══██║██║  ██║██║██║   ██║██║   ██║██╔══██║██╔══██╗██║  ██║██╔══╝  ██║╚██╗██║
+██║  ██║██║  ██║██████╔╝██║╚██████╔╝╚██████╔╝██║  ██║██║  ██║██████╔╝███████╗██║ ╚████║
+╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═══╝
 ```
 
 Live radio from around the planet, in your terminal. A TUI client for
@@ -13,7 +15,7 @@ Live radio from around the planet, in your terminal. A TUI client for
 - Browse ~13,000 places, busiest first.
 - Fuzzy-grep places locally as you type, or search stations on radio.garden.
 - Stream MP3 / AAC / OGG / FLAC, including stations behind redirect chains and `.pls`/`.m3u` playlists.
-- Phosphor-green hacker UI with a tuner bar, a spectrum display and digital rain.
+- Phosphor-green hacker UI with an ANSI Shadow logo, a tuner bar, a spectrum display and digital rain.
 
 ## Install & run
 

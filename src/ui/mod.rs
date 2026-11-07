@@ -38,33 +38,71 @@ const MATRIX_CHARS: &[char] = &[
 ];
 const BARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
-// Glyphs (figlet "small") used to assemble the banner. Every row of a glyph
-// has the same width so the banner always lines up.
-const GLYPHS: &[(char, [&str; 4])] = &[
-    ('R', [" ___ ", "| _ \\", "|   /", "|_|_\\"]),
-    ('A', ["   _   ", "  /_\\  ", " / _ \\ ", "/_/ \\_\\"]),
-    ('D', [" ___  ", "|   \\ ", "| |) |", "|___/ "]),
-    ('I', [" ___ ", "|_ _|", " | | ", "|___|"]),
-    ('O', ["  ___  ", " / _ \\ ", "| (_) |", " \\___/ "]),
-    ('G', ["  ___ ", " / __|", "| (_ |", " \\___|"]),
-    ('E', [" ___ ", "| __|", "| _| ", "|___|"]),
-    ('N', [" _  _ ", "| \\| |", "| .` |", "|_|\\_|"]),
-    (' ', ["  ", "  ", "  ", "  "]),
+// The main logo, "RADIOGARDEN" in the figlet "ANSI Shadow" font.
+const SHADOW_LOGO: [&str; 6] = [
+    "██████╗  █████╗ ██████╗ ██╗ ██████╗  ██████╗  █████╗ ██████╗ ██████╗ ███████╗███╗   ██╗",
+    "██╔══██╗██╔══██╗██╔══██╗██║██╔═══██╗██╔════╝ ██╔══██╗██╔══██╗██╔══██╗██╔════╝████╗  ██║",
+    "██████╔╝███████║██║  ██║██║██║   ██║██║  ███╗███████║██████╔╝██║  ██║█████╗  ██╔██╗ ██║",
+    "██╔══██╗██╔══██║██║  ██║██║██║   ██║██║   ██║██╔══██║██╔══██╗██║  ██║██╔══╝  ██║╚██╗██║",
+    "██║  ██║██║  ██║██████╔╝██║╚██████╔╝╚██████╔╝██║  ██║██║  ██║██████╔╝███████╗██║ ╚████║",
+    "╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═══╝",
+];
+
+// Fallback for narrower terminals: figlet "small", assembled per glyph.
+// Every row of a glyph has the same width so the banner always lines up.
+const SMALL_GLYPHS: &[(char, [&str; 4])] = &[
+    ('R', [r" ___ ", r"| _ \", r"|   /", r"|_|_\"]),
+    ('A', [r"   _   ", r"  /_\  ", r" / _ \ ", r"/_/ \_\"]),
+    ('D', [r" ___  ", r"|   \ ", r"| |) |", r"|___/ "]),
+    ('I', [r" ___ ", r"|_ _|", r" | | ", r"|___|"]),
+    ('O', [r"  ___  ", r" / _ \ ", r"| (_) |", r" \___/ "]),
+    ('G', [r"  ___ ", r" / __|", r"| (_ |", r" \___|"]),
+    ('E', [r" ___ ", r"| __|", r"| _| ", r"|___|"]),
+    ('N', [r" _  _ ", r"| \| |", r"| .` |", r"|_|\_|"]),
+    (' ', [r"  ", r"  ", r"  ", r"  "]),
 ];
 const BANNER_TEXT: &str = "RADIO GARDEN";
-const BANNER_ROWS: u16 = 4;
-const MIN_HEIGHT_FOR_BANNER: u16 = 28;
+const BANNER_ROWS: u16 = 6;
+const MIN_HEIGHT_FOR_BANNER: u16 = 30;
+/// Room the [sys]/[net]/... readout needs beside the logo.
+const BANNER_INFO_WIDTH: u16 = 38;
 
-fn banner_lines() -> [String; 4] {
-    let mut rows: [String; 4] = Default::default();
+fn assemble<const N: usize>(font: &[(char, [&str; N])]) -> [String; N] {
+    let mut rows: [String; N] = std::array::from_fn(|_| String::new());
     for ch in BANNER_TEXT.chars() {
-        if let Some((_, glyph)) = GLYPHS.iter().find(|(c, _)| *c == ch) {
+        if let Some((_, glyph)) = font.iter().find(|(c, _)| *c == ch) {
             for (row, part) in rows.iter_mut().zip(glyph) {
                 row.push_str(part);
             }
         }
     }
     rows
+}
+
+fn width_of<S: AsRef<str>>(rows: &[S]) -> u16 {
+    rows.first()
+        .map_or(0, |r| r.as_ref().chars().count() as u16)
+}
+
+/// Colour an ANSI Shadow row: solid blocks lit, box-drawing "shadow" dim.
+fn shadow_line(row: &str, face: Color) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    let mut run = String::new();
+    let mut run_is_face = true;
+    for ch in row.chars() {
+        let is_face = ch == '█' || ch == ' ';
+        if is_face != run_is_face && !run.is_empty() {
+            let style = if run_is_face { bold(face) } else { s(DARK) };
+            spans.push(Span::styled(std::mem::take(&mut run), style));
+        }
+        run_is_face = is_face;
+        run.push(ch);
+    }
+    if !run.is_empty() {
+        let style = if run_is_face { bold(face) } else { s(DARK) };
+        spans.push(Span::styled(run, style));
+    }
+    Line::from(spans)
 }
 
 fn banner_height(term_height: u16) -> u16 {
@@ -242,27 +280,46 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_banner(frame: &mut Frame, app: &App, area: Rect) {
-    let art = banner_lines();
-    let art_width = art[0].chars().count() as u16 + 2;
-    let shades = [GREEN, GREEN, MID, DIM];
+    let shadow = SHADOW_LOGO;
+    let small = assemble(SMALL_GLYPHS);
+
+    let (lines, art_width): (Vec<Line>, u16) = if area.width >= width_of(&shadow) + 2 {
+        let shades = [GREEN, GREEN, GREEN, MID, MID, DIM];
+        (
+            shadow
+                .iter()
+                .zip(shades)
+                .map(|(row, c)| shadow_line(row, c))
+                .collect(),
+            width_of(&shadow) + 2,
+        )
+    } else if area.width >= width_of(&small) + 2 {
+        let shades = [GREEN, GREEN, MID, DIM];
+        let mut lines = vec![Line::raw("")];
+        lines.extend(
+            small
+                .iter()
+                .zip(shades)
+                .map(|(row, c)| Line::from(Span::styled(format!(" {row}"), bold(c)))),
+        );
+        (lines, width_of(&small) + 2)
+    } else {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::raw(""),
+                Line::from(Span::styled(" RADIO//GARDEN", bold(GREEN))),
+            ]),
+            area,
+        );
+        return;
+    };
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(art_width), Constraint::Min(0)])
         .split(area);
-
-    if area.width >= art_width {
-        let lines: Vec<Line> = art
-            .iter()
-            .zip(shades)
-            .map(|(row, c)| Line::from(Span::styled(format!(" {row}"), bold(c))))
-            .collect();
-        frame.render_widget(Paragraph::new(lines), cols[0]);
-    } else {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(" RADIO//GARDEN", bold(GREEN)))),
-            area,
-        );
+    frame.render_widget(Paragraph::new(lines), cols[0]);
+    if cols[1].width < BANNER_INFO_WIDTH {
         return;
     }
 
@@ -274,6 +331,7 @@ fn render_banner(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("● ONLINE", bold(GREEN))
     };
     let info = vec![
+        Line::raw(""),
         Line::from(vec![
             Span::styled(" [sys] ", s(DIM)),
             Span::styled(concat!("radio_tui v", env!("CARGO_PKG_VERSION")), s(MID)),
@@ -998,10 +1056,17 @@ mod tests {
 
     #[test]
     fn banner_rows_line_up() {
-        let rows = banner_lines();
-        let w = rows[0].chars().count();
-        assert!(w > 0);
-        assert!(rows.iter().all(|r| r.chars().count() == w));
+        let w = width_of(&SHADOW_LOGO);
+        assert!(SHADOW_LOGO.iter().all(|r| r.chars().count() as u16 == w));
+        for glyph in SMALL_GLYPHS {
+            let gw = glyph.1[0].chars().count();
+            assert!(
+                glyph.1.iter().all(|r| r.chars().count() == gw),
+                "{:?}",
+                glyph.0
+            );
+        }
+        assert!(w > width_of(&assemble(SMALL_GLYPHS)));
     }
 
     #[test]
