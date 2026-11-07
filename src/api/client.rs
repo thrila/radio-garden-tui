@@ -5,6 +5,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, mpsc};
 
 use super::types::*;
+use crate::budget::{ByteBudget, MAX_PIECE};
 use crate::error::{RadioError, Result};
 
 const BASE_URL: &str = "https://radio.garden/api";
@@ -19,17 +20,23 @@ const MAX_PLAYLIST_HOPS: usize = 4;
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(250);
 const JSON_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_RETRIES: u32 = 3;
-/// Number of network chunks buffered between the HTTP reader and the decoder.
-const STREAM_CHANNEL_CAPACITY: usize = 128;
+/// Initial in-memory buffer cap; the player resizes it to a fixed number of
+/// seconds once it knows the bitrate.
+const INITIAL_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_PLAYLIST_BYTES: usize = 64 * 1024;
 
 /// An open, live audio stream. Bytes arrive on `chunks` until the server
-/// closes the connection or the receiver is dropped (which cancels the read).
+/// closes the connection or the consumer closes `budget` (which cancels the
+/// read). The reader only fetches while `budget` has room, so memory use is
+/// bounded by the budget's capacity.
 pub struct LiveStream {
     /// Final URL after following every redirect / playlist hop.
     pub url: String,
     pub content_type: Option<String>,
-    pub chunks: mpsc::Receiver<Vec<u8>>,
+    /// Advertised bitrate (`icy-br` / `ice-audio-info`), if the server sent one.
+    pub bitrate_kbps: Option<u32>,
+    pub chunks: mpsc::UnboundedReceiver<Vec<u8>>,
+    pub budget: ByteBudget,
 }
 
 pub struct ApiClient {
@@ -161,20 +168,29 @@ impl ApiClient {
                     ));
                 }
                 StreamKind::Audio => {
-                    let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
+                    let bitrate_kbps = advertised_bitrate(resp.headers());
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    let budget = ByteBudget::new(INITIAL_BUFFER_BYTES);
+                    let pump_budget = budget.clone();
                     tokio::spawn(async move {
                         // Ends when the server closes, a read fails, or the
-                        // player drops the receiver (stop / station change).
-                        while let Ok(Some(chunk)) = resp.chunk().await {
-                            if tx.send(chunk.to_vec()).await.is_err() {
-                                break;
+                        // player closes the budget / drops the receiver.
+                        'read: while let Ok(Some(chunk)) = resp.chunk().await {
+                            for piece in chunk.chunks(MAX_PIECE) {
+                                if !pump_budget.acquire(piece.len()).await
+                                    || tx.send(piece.to_vec()).is_err()
+                                {
+                                    break 'read;
+                                }
                             }
                         }
                     });
                     return Ok(LiveStream {
                         url: final_url,
                         content_type,
+                        bitrate_kbps,
                         chunks: rx,
+                        budget,
                     });
                 }
             }
@@ -184,6 +200,31 @@ impl ApiClient {
             "too many nested playlists".into(),
         ))
     }
+}
+
+/// Bitrate in kbps from Icecast/Shoutcast headers: `icy-br: 128` (sometimes
+/// `128,128` or in bps) or `ice-audio-info: ...;bitrate=128`.
+fn advertised_bitrate(headers: &reqwest::header::HeaderMap) -> Option<u32> {
+    let icy = headers
+        .get("icy-br")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .and_then(|v| v.trim().parse::<u32>().ok());
+    let ice = || {
+        headers
+            .get("ice-audio-info")
+            .and_then(|v| v.to_str().ok())?
+            .split(';')
+            .find_map(|kv| {
+                let (k, v) = kv.split_once('=')?;
+                let k = k.trim().to_ascii_lowercase();
+                (k == "bitrate" || k == "ice-bitrate").then(|| v.trim().parse::<u32>().ok())?
+            })
+    };
+    let kbps = icy.or_else(ice)?;
+    // Some servers report bits per second.
+    let kbps = if kbps >= 8_000 { kbps / 1000 } else { kbps };
+    (8..=2_000).contains(&kbps).then_some(kbps)
 }
 
 #[derive(Debug, PartialEq)]
@@ -311,6 +352,28 @@ mod tests {
     #[test]
     fn playlist_empty() {
         assert_eq!(parse_playlist("#EXTM3U\n"), None);
+    }
+
+    #[test]
+    fn bitrate_from_headers() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        assert_eq!(advertised_bitrate(&h), None);
+        h.insert("icy-br", HeaderValue::from_static("128"));
+        assert_eq!(advertised_bitrate(&h), Some(128));
+        h.insert("icy-br", HeaderValue::from_static("64, 64"));
+        assert_eq!(advertised_bitrate(&h), Some(64));
+        h.insert("icy-br", HeaderValue::from_static("192000"));
+        assert_eq!(advertised_bitrate(&h), Some(192));
+
+        let mut h = HeaderMap::new();
+        h.insert(
+            "ice-audio-info",
+            HeaderValue::from_static("channels=2;samplerate=44100;bitrate=96"),
+        );
+        assert_eq!(advertised_bitrate(&h), Some(96));
+        h.insert("ice-audio-info", HeaderValue::from_static("bitrate=junk"));
+        assert_eq!(advertised_bitrate(&h), None);
     }
 
     #[test]
