@@ -410,8 +410,14 @@ fn lat_lon_label((lon, lat): (f64, f64)) -> String {
     )
 }
 
-/// Braille world map with every known place as a dot and a blinking marker
-/// at `target` (lon, lat).
+/// Map latitude window: Antarctica and the high Arctic have no stations, so
+/// cropping them gives the inhabited world more rows.
+const MAP_LAT: [f64; 2] = [-58.0, 84.0];
+const STATION_DOT: Color = Color::Rgb(0, 75, 22);
+const COAST: Color = Color::Rgb(0, 170, 45);
+const RETICLE: Color = Color::Rgb(110, 75, 0);
+
+/// Braille world map: every known place as a dim dot, bright coastlines, and a targeting reticle + label on `target` (lon, lat).
 fn render_world(
     frame: &mut Frame,
     app: &App,
@@ -429,30 +435,54 @@ fn render_world(
         .background_color(BG)
         .marker(Marker::Braille)
         .x_bounds([-180.0, 180.0])
-        .y_bounds([-90.0, 90.0])
+        .y_bounds(MAP_LAT)
         .paint(|ctx| {
-            ctx.draw(&Map {
-                color: DARK,
-                resolution: MapResolution::High,
-            });
-            ctx.layer();
             ctx.draw(&Points {
                 coords: &app.place_points,
-                color: DIM,
+                color: STATION_DOT,
             });
-            if let Some((lon, lat)) = target {
-                ctx.layer();
-                let marker = if pulse { "◉" } else { "○" };
-                ctx.print(lon, lat, Span::styled(marker, bold(AMBER)));
-                if let Some(label) = label {
-                    // Put the label on whichever side has more room.
-                    let x = if lon < 60.0 {
-                        lon + 6.0
-                    } else {
-                        lon - 6.0 - label.chars().count() as f64 * 4.0
-                    };
-                    ctx.print(x, lat, Span::styled(label.to_string(), bold(WHITE)));
-                }
+            ctx.layer();
+            ctx.draw(&Map {
+                color: COAST,
+                resolution: MapResolution::High,
+            });
+
+            let Some((lon, lat)) = target else {
+                return;
+            };
+            // Reticle: four short arms around the marker, leaving the
+            // rest of the map untouched.
+            ctx.layer();
+            let mut hair = Vec::new();
+            for i in 0..8 {
+                let d = 5.0 + i as f64 * 1.5;
+                hair.extend([(lon - d, lat), (lon + d, lat)]);
+                let v = 3.5 + i as f64 * 0.9;
+                hair.extend([(lon, lat - v), (lon, lat + v)]);
+            }
+            ctx.draw(&Points {
+                coords: &hair,
+                color: RETICLE,
+            });
+
+            ctx.layer();
+            let marker = if pulse { "◉" } else { "◎" };
+            ctx.print(lon, lat, Span::styled(marker, bold(AMBER)));
+            if let Some(label) = label {
+                // Boxed label just above the marker, kept inside the map
+                // (each cell is ~360/width degrees wide).
+                let text = format!(" {label} ");
+                let deg_per_cell = 360.0 / area.width.saturating_sub(2).max(1) as f64;
+                let width_deg = text.chars().count() as f64 * deg_per_cell;
+                let x = (lon - width_deg / 2.0).clamp(-180.0, (180.0 - width_deg).max(-180.0));
+                let row_deg =
+                    (MAP_LAT[1] - MAP_LAT[0]) / area.height.saturating_sub(2).max(1) as f64;
+                let y = if lat + row_deg * 1.5 < MAP_LAT[1] {
+                    lat + row_deg * 1.5
+                } else {
+                    lat - row_deg * 1.5
+                };
+                ctx.print(x, y, Span::styled(text, bold(BG).bg(AMBER)));
             }
         });
     frame.render_widget(canvas, area);
@@ -781,8 +811,16 @@ fn render_now_playing(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn kv<'a>(key: &'a str, value: Span<'a>) -> Line<'a> {
+    kv_mark('*', s(GREEN), key, value)
+}
+
+/// `[*] key      : value` — the mark shows status at a glance
+/// (`+` good, `!` problem, `*` info).
+fn kv_mark<'a>(mark: char, mark_style: Style, key: &'a str, value: Span<'a>) -> Line<'a> {
     Line::from(vec![
-        Span::styled(" > ", s(DIM)),
+        Span::styled(" [", s(DIM)),
+        Span::styled(mark.to_string(), mark_style.add_modifier(Modifier::BOLD)),
+        Span::styled("] ", s(DIM)),
         Span::styled(format!("{key:<9}"), s(MID)),
         Span::styled(": ", s(DARK)),
         value,
@@ -796,7 +834,7 @@ fn buffer_span(app: &App, width: usize) -> Span<'static> {
             let color = if fill < 0.2 { AMBER } else { MID };
             Span::styled(
                 format!(
-                    "{} {:>4.1}s / {:.0}s @ {} kbps",
+                    "{} {:.1}/{:.0}s {}k",
                     volume_bar(fill, width),
                     b.seconds,
                     b.capacity_seconds,
@@ -818,10 +856,10 @@ fn render_signal_info(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let (tag, tag_style) = status_tag(app);
-    let status_style = match app.playback {
-        Playback::Error(_) => s(RED),
-        Playback::Playing => s(GREEN),
-        _ => s(AMBER),
+    let (status_mark, status_style) = match app.playback {
+        Playback::Error(_) => ('!', s(RED)),
+        Playback::Playing => ('+', s(GREEN)),
+        _ => ('*', s(AMBER)),
     };
     let lines = vec![
         Line::from(Span::styled(
@@ -830,7 +868,9 @@ fn render_signal_info(frame: &mut Frame, app: &App, area: Rect) {
         )),
         Line::raw(""),
         kv("location", Span::styled(station.location(), s(WHITE))),
-        kv(
+        kv_mark(
+            status_mark,
+            status_style,
             "status",
             Span::styled(
                 format!("{tag} {}", playback_label(app)),
@@ -843,7 +883,7 @@ fn render_signal_info(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(
                 format!(
                     "{} {:>3}%",
-                    volume_bar(app.volume, 20),
+                    volume_bar(app.volume, 12),
                     (app.volume * 100.0).round()
                 ),
                 s(MID),
@@ -858,7 +898,7 @@ fn render_signal_info(frame: &mut Frame, app: &App, area: Rect) {
                 s(DIM),
             ),
         ),
-        kv("buffer", buffer_span(app, 20)),
+        kv("buffer", buffer_span(app, 12)),
         kv(
             "node",
             Span::styled(format!("rg://{}", station.channel_id), s(DIM)),
