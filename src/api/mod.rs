@@ -1,7 +1,9 @@
 pub mod client;
+pub mod radio_browser;
 pub mod types;
 
 pub use client::{ApiClient, LiveStream};
+pub use radio_browser::{RadioBrowserClient, RbQuery, RbStation};
 pub use types::*;
 
 #[cfg(test)]
