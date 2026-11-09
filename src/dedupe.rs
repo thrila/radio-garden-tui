@@ -207,38 +207,53 @@ impl DedupeIndex {
         }
 
         let country = self.countries.get(&c.country_code.to_ascii_uppercase())?;
-        let name = tokens(c.name);
-        if name.is_empty() {
+
+        // The name as given, plus the part before a tagline separator
+        // ("KEXP: The greatest radio station in the galaxy" -> "KEXP").
+        // " - " is deliberately not a separator: it usually names a sister
+        // channel ("Cool FM - Goldies"), which is a different station.
+        let mut forms = vec![tokens(c.name)];
+        if let Some((head, _)) = c.name.split_once([':', '|']) {
+            let head = tokens(head);
+            if !head.is_empty() && head != forms[0] {
+                forms.push(head);
+            }
+        }
+        forms.retain(|f| !f.is_empty());
+        if forms.is_empty() {
             return None;
         }
 
-        // 2a. Same normalized name anywhere in the country
-        //     ("Cool FM" vs Radio Garden's "Cool FM 96.9").
-        let full = name.join(" ");
-        if country.names.contains_key(&full) {
-            return Some(MatchReason::Name);
-        }
+        let mut variants = Vec::new();
+        for name in &forms {
+            // 2a. Same normalized name anywhere in the country
+            //     ("Cool FM" vs Radio Garden's "Cool FM 96.9").
+            let full = name.join(" ");
+            if country.names.contains_key(&full) {
+                return Some(MatchReason::Name);
+            }
+            variants.push(full);
 
-        // 2b. The Radio Browser name carries a city that is a Radio Garden
-        //     place: strip it and require the channel to be in *that* place
-        //     ("KEXP 90.3 Seattle, WA" vs "KEXP 90.3 FM" in "Seattle WA").
-        let mut variants = vec![full];
-        for len in (1..=MAX_PLACE_WORDS.min(name.len().saturating_sub(1))).rev() {
-            for window in name.windows(len) {
-                if !country.places.contains(window) {
-                    continue;
-                }
-                let place_key = window.join(" ");
-                if let Some(rest) = strip_phrase(&name, window) {
-                    let rest = rest.join(" ");
-                    if country
-                        .names
-                        .get(&rest)
-                        .is_some_and(|places| places.contains(&place_key))
-                    {
-                        return Some(MatchReason::Name);
+            // 2b. The name carries a city that is a Radio Garden place:
+            //     strip it and require the channel to be in *that* place
+            //     ("KEXP 90.3 Seattle, WA" vs "KEXP 90.3 FM" in "Seattle WA").
+            for len in (1..=MAX_PLACE_WORDS.min(name.len().saturating_sub(1))).rev() {
+                for window in name.windows(len) {
+                    if !country.places.contains(window) {
+                        continue;
                     }
-                    variants.push(rest);
+                    let place_key = window.join(" ");
+                    if let Some(rest) = strip_phrase(name, window) {
+                        let rest = rest.join(" ");
+                        if country
+                            .names
+                            .get(&rest)
+                            .is_some_and(|places| places.contains(&place_key))
+                        {
+                            return Some(MatchReason::Name);
+                        }
+                        variants.push(rest);
+                    }
                 }
             }
         }
@@ -367,6 +382,24 @@ mod tests {
             idx.find(&cand("KEXP 90.3 FM Seattle, WA", "us")),
             Some(MatchReason::Name)
         );
+    }
+
+    #[test]
+    fn taglines_after_colon_or_bar_are_ignored() {
+        let idx = sample_index();
+        assert_eq!(
+            idx.find(&cand(
+                "KEXP: The greatest radio station in the galaxy",
+                "US"
+            )),
+            Some(MatchReason::Name)
+        );
+        assert_eq!(
+            idx.find(&cand("KEXP | Where the music matters", "US")),
+            Some(MatchReason::Name)
+        );
+        // " - " names a sister channel, not a tagline.
+        assert_eq!(idx.find(&cand("Cool FM - Goldies", "NG")), None);
     }
 
     #[test]
