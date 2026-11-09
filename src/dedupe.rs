@@ -245,7 +245,10 @@ impl DedupeIndex {
 
         // 3. Fuzzy, same country, long names only.
         if FUZZY_ENABLED {
-            for v in variants.iter().filter(|v| v.chars().count() >= FUZZY_MIN_LEN) {
+            for v in variants
+                .iter()
+                .filter(|v| v.chars().count() >= FUZZY_MIN_LEN)
+            {
                 let first = v.chars().next();
                 let hit = country.names.keys().any(|known| {
                     known.chars().count() >= FUZZY_MIN_LEN
@@ -332,7 +335,9 @@ mod tests {
 
     #[test]
     fn frequencies() {
-        for f in ["98.7", "101", "96,9", "96.9fm", "fm101", "1080am", "88.5mhz"] {
+        for f in [
+            "98.7", "101", "96,9", "96.9fm", "fm101", "1080am", "88.5mhz",
+        ] {
             assert!(is_frequency(f), "{f}");
         }
         for f in ["kexp", "1.2.3", "fm", "", "24/7"] {
@@ -383,10 +388,16 @@ mod tests {
     fn city_must_be_the_channels_own_place() {
         let idx = sample_index();
         // "Kiss FM" is a Berlin channel; "Kiss FM Berlin" is the same one.
-        assert_eq!(idx.find(&cand("Kiss FM Berlin", "DE")), Some(MatchReason::Name));
+        assert_eq!(
+            idx.find(&cand("Kiss FM Berlin", "DE")),
+            Some(MatchReason::Name)
+        );
         // "Kano" is a Nigerian place, but Kano's channel is "Cool FM Kano",
         // whose base "cool" is in Kano -> match; while "Wazobia Kano" isn't.
-        assert_eq!(idx.find(&cand("Cool FM Kano", "NG")), Some(MatchReason::Name));
+        assert_eq!(
+            idx.find(&cand("Cool FM Kano", "NG")),
+            Some(MatchReason::Name)
+        );
         assert_eq!(idx.find(&cand("Wazobia FM Kano", "NG")), None);
     }
 
@@ -435,7 +446,9 @@ mod tests {
             stream_url: url,
         };
         assert_eq!(
-            idx.find(&by_url("https://kexp-mp3-128.streamguys1.com:443/kexp128.mp3?x=1")),
+            idx.find(&by_url(
+                "https://kexp-mp3-128.streamguys1.com:443/kexp128.mp3?x=1"
+            )),
             Some(MatchReason::StreamHost)
         );
         assert_eq!(idx.find(&by_url("https://s4.radio.co/abc/listen")), None);
