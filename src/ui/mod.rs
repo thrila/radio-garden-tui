@@ -15,7 +15,7 @@ use ratatui::{
     },
 };
 
-use crate::app::{App, ListState, Notice, Playback, Screen, SearchFocus, SearchItem};
+use crate::app::{App, Filtering, ListState, Notice, Playback, Screen, SearchFocus, SearchItem};
 
 // ---------------------------------------------------------------------------
 // Palette: phosphor green CRT
@@ -122,8 +122,11 @@ const LIST_CHROME_ROWS: u16 = 3;
 pub fn list_rows(term_height: u16, screen: Screen) -> usize {
     let mut used =
         banner_height(term_height) + PROMPT_ROWS + PLAYER_ROWS + FOOTER_ROWS + LIST_CHROME_ROWS;
-    if screen == Screen::Search {
-        used += SEARCH_INPUT_ROWS;
+    match screen {
+        Screen::Search => used += SEARCH_INPUT_ROWS,
+        // Input box plus the one-line filter status.
+        Screen::Beyond => used += SEARCH_INPUT_ROWS + 1,
+        _ => {}
     }
     term_height.saturating_sub(used).max(1) as usize
 }
@@ -254,6 +257,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Screen::Places => render_places(frame, app, chunks[2]),
         Screen::Stations => render_stations(frame, app, chunks[2]),
         Screen::Search => render_search(frame, app, chunks[2]),
+        Screen::Beyond => render_beyond(frame, app, chunks[2]),
         Screen::NowPlaying => render_now_playing(frame, app, chunks[2]),
     }
     render_player_bar(frame, app, chunks[3]);
@@ -328,7 +332,8 @@ fn render_banner(frame: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled(" [idx] ", s(DIM)),
-            Span::styled(format!("{} nodes indexed", app.places.len()), s(MID)),
+            Span::styled(format!("{} places ", app.places.len()), s(MID)),
+            index_span(app),
         ]),
         Line::from(vec![
             Span::styled(" [aud] ", s(DIM)),
@@ -350,6 +355,7 @@ fn render_breadcrumb(frame: &mut Frame, app: &App, area: Rect) {
         Screen::Places => vec!["PLACES".into()],
         Screen::Stations => vec!["PLACES".into(), place(app.current_place.as_ref())],
         Screen::Search => vec!["SEARCH".into()],
+        Screen::Beyond => vec!["BEYOND RADIO GARDEN".into()],
         Screen::NowPlaying => vec![
             "TUNER".into(),
             app.now_playing
@@ -790,6 +796,165 @@ fn render_search(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn source_style(source: &crate::api::StationSource) -> Style {
+    match source {
+        crate::api::StationSource::RadioGarden => bold(GREEN),
+        crate::api::StationSource::RadioBrowser { .. } => bold(CYAN),
+    }
+}
+
+fn source_span(source: &crate::api::StationSource) -> Span<'static> {
+    Span::styled(source.label().to_string(), source_style(source))
+}
+
+/// Radio Garden index state for the banner.
+fn index_span(app: &App) -> Span<'static> {
+    let idx = &app.index;
+    if let Some(e) = &idx.error {
+        return Span::styled(format!("· index: {e}"), s(RED));
+    }
+    match (idx.percent(), idx.filtering()) {
+        (Some(pct), _) => Span::styled(format!("· indexing RG {pct}%"), bold(AMBER)),
+        (None, Filtering::Filtered) => {
+            Span::styled(format!("· {} RG stations", idx.channels), s(MID))
+        }
+        (None, Filtering::Partial) => Span::styled(
+            format!("· {} RG stations (partial)", idx.channels),
+            s(AMBER),
+        ),
+        (None, Filtering::NotFiltered) => Span::styled("· no RG index yet", s(DIM)),
+    }
+}
+
+/// Filtering status for the Beyond list title.
+fn beyond_status(app: &App) -> (String, Style) {
+    let pct = app
+        .index
+        .percent()
+        .map(|p| format!(" — indexing Radio Garden {p}%"))
+        .unwrap_or_default();
+    match app.beyond_filtering {
+        Filtering::Filtered => (
+            format!(
+                "filtered against {} RG stations · {} on RG hidden · {} dupes merged",
+                app.index.channels, app.beyond_hidden, app.beyond_collapsed
+            ),
+            s(MID),
+        ),
+        Filtering::Partial => (
+            format!(
+                "PARTLY FILTERED ({} RG stations so far){pct} · {} hidden",
+                app.index.channels, app.beyond_hidden
+            ),
+            bold(AMBER),
+        ),
+        Filtering::NotFiltered => (format!("NOT YET FILTERED{pct}"), bold(AMBER)),
+    }
+}
+
+fn render_beyond(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(SEARCH_INPUT_ROWS),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    let typing = app.beyond_focus == SearchFocus::Input;
+    let mut input = vec![
+        Span::styled(" radio-browser ", s(DIM)),
+        Span::styled("\"", s(DIM)),
+        Span::styled(app.beyond_input.as_str(), bold(CYAN)),
+    ];
+    if typing && blink(app) {
+        input.push(Span::styled("█", s(CYAN)));
+    }
+    input.push(Span::styled("\"", s(DIM)));
+    if typing {
+        input.push(Span::styled(
+            "   name tag:jazz cc:NG codec:mp3 br:128 · ⏎ search",
+            s(DARK),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(input)).block(panel("BEYOND RADIO GARDEN", typing)),
+        chunks[0],
+    );
+
+    let (status, status_style) = beyond_status(app);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" [*] ", s(DIM)),
+            Span::styled("source: radio-browser.info · ", s(DIM)),
+            Span::styled(status, status_style),
+        ])),
+        chunks[1],
+    );
+
+    let st = &app.beyond_state;
+    let rows = app.beyond_results[visible(st)]
+        .iter()
+        .enumerate()
+        .map(|(rel, rb)| {
+            let quality = match (rb.codec.as_str(), rb.bitrate) {
+                ("", 0) => String::new(),
+                (c, 0) => c.to_ascii_lowercase(),
+                (c, b) => format!("{} {b}k", c.to_ascii_lowercase()),
+            };
+            let tags: String = rb.tag_list().take(3).collect::<Vec<_>>().join(", ");
+            Row::new(vec![
+                idx_cell(st.offset + rel),
+                Cell::from(Span::styled("[RB]", bold(CYAN))),
+                Cell::from(Span::styled(rb.name.trim().to_string(), s(WHITE))),
+                Cell::from(Span::styled(rb.countrycode.clone(), s(MID))),
+                Cell::from(Span::styled(quality, s(DIM))),
+                Cell::from(Span::styled(tags, s(DARK))),
+                Cell::from(Span::styled(format!("{:>6}", rb.votes), s(AMBER))),
+            ])
+        })
+        .collect();
+
+    let empty = if app.loading.is_some() {
+        loading_text(app, "asking radio-browser.info")
+    } else {
+        Text::from(vec![
+            Line::raw(""),
+            Line::from(Span::styled(
+                "stations from radio-browser.info that Radio Garden doesn't have",
+                s(DIM),
+            )),
+            Line::from(Span::styled(
+                "type a name and/or filters, press enter",
+                s(DARK),
+            )),
+        ])
+    };
+
+    render_list(
+        frame,
+        chunks[2],
+        ListView {
+            title: format!("STATIONS {}", st.total),
+            focused: !typing,
+            header: vec!["  ID", "SRC", "NAME", "CC", "CODEC", "TAGS", " VOTES"],
+            widths: vec![
+                Constraint::Length(4),
+                Constraint::Length(4),
+                Constraint::Percentage(42),
+                Constraint::Length(3),
+                Constraint::Length(9),
+                Constraint::Percentage(30),
+                Constraint::Length(7),
+            ],
+            rows,
+            state: st,
+            empty,
+        },
+    );
+}
+
 // ---------------------------------------------------------------------------
 // now playing
 // ---------------------------------------------------------------------------
@@ -868,6 +1033,7 @@ fn render_signal_info(frame: &mut Frame, app: &App, area: Rect) {
         )),
         Line::raw(""),
         kv("location", Span::styled(station.location(), s(WHITE))),
+        kv("source", source_span(&station.source)),
         kv_mark(
             status_mark,
             status_style,
@@ -970,6 +1136,10 @@ fn render_player_bar(frame: &mut Frame, app: &App, area: Rect) {
 
     match &app.now_playing {
         Some(station) => {
+            spans.push(Span::styled(
+                format!("[{}] ", station.source.short()),
+                source_style(&station.source),
+            ));
             let pulse = if app.playback == Playback::Playing {
                 let frames = ["▁▃▅", "▃▅▇", "▅▇▅", "▇▅▃", "▅▃▁", "▃▁▃"];
                 frames[(app.tick as usize / 2) % frames.len()]
@@ -1027,6 +1197,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("⏎", "open"),
             ("/", "grep"),
             ("r", "random"),
+            ("b", "beyond"),
             ("spc", "play/stop"),
             ("n", "tuner"),
             ("?", "help"),
@@ -1058,6 +1229,19 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ("r", "random"),
             ("esc", "back"),
             ("q", "quit"),
+        ],
+        Screen::Beyond if app.beyond_focus == SearchFocus::Input => &[
+            ("⏎", "search"),
+            ("↓", "results"),
+            ("esc", "back"),
+            ("^c", "quit"),
+        ],
+        Screen::Beyond => &[
+            ("⏎", "tune"),
+            ("/", "edit"),
+            ("r", "random"),
+            ("I", "rebuild index"),
+            ("esc", "query"),
         ],
     };
 
@@ -1091,7 +1275,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_help(frame: &mut Frame, area: Rect) {
     let w = 58.min(area.width.saturating_sub(4));
-    let h = 22.min(area.height.saturating_sub(2));
+    let h = 28.min(area.height.saturating_sub(2));
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -1123,6 +1307,11 @@ fn render_help(frame: &mut Frame, area: Rect) {
         entry("/", "grep places (live, local)"),
         entry("⏎ (in query)", "search radio.garden"),
         entry("↓ / tab", "jump into results"),
+        Line::raw(""),
+        section("BEYOND RADIO GARDEN"),
+        entry("b", "Radio Browser stations not on RG"),
+        entry("query", "name tag:jazz cc:NG codec:mp3 br:128"),
+        entry("I (results)", "rebuild the Radio Garden index"),
         Line::raw(""),
         Line::from(Span::styled("        press any key to close", s(DIM))),
     ];
