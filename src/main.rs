@@ -3,6 +3,8 @@ mod app;
 mod audio;
 mod budget;
 mod cache;
+mod countries;
+mod dedupe;
 mod error;
 mod event;
 mod ui;
