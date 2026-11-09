@@ -43,9 +43,9 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--probe") => {
-            let channel_id = args
-                .get(1)
-                .ok_or_else(|| anyhow::anyhow!("usage: --probe <channel_id> [seconds]"))?;
+            let channel_id = args.get(1).ok_or_else(|| {
+                anyhow::anyhow!("usage: --probe <channel_id | stream_url> [seconds]")
+            })?;
             let secs = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
             return probe(&api, channel_id, secs).await;
         }
@@ -357,12 +357,18 @@ fn execute(cmd: Command, app: &App, services: &mut Services, player: &mut dyn Pl
     true
 }
 
-/// `radio_tui --probe <channel_id> [seconds]`: resolve and play a station
-/// without the TUI, printing each step. Handy for diagnosing a station that
-/// won't play.
+/// `radio_tui --probe <channel_id | stream_url> [seconds]`: resolve and play
+/// a station without the TUI, printing each step. Handy for diagnosing a
+/// station that won't play.
 async fn probe(api: &ApiClient, channel_id: &str, secs: u64) -> anyhow::Result<()> {
-    println!("[probe] listen url: {}", ApiClient::listen_url(channel_id));
-    let stream = api.open_stream(channel_id).await?;
+    // A full URL (e.g. a Radio Browser url_resolved) is played directly.
+    let stream = if channel_id.starts_with("http://") || channel_id.starts_with("https://") {
+        println!("[probe] stream url: {channel_id}");
+        api.open_url(channel_id).await?
+    } else {
+        println!("[probe] listen url: {}", ApiClient::listen_url(channel_id));
+        api.open_stream(channel_id).await?
+    };
     println!(
         "[probe] resolved:   {} ({})",
         stream.url,
