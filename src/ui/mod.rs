@@ -1224,6 +1224,7 @@ mod tests {
             place: None,
             country: None,
             website: None,
+            source: Default::default(),
         });
         app.playback = Playback::Playing;
         app.screen = Screen::NowPlaying;

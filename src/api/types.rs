@@ -112,7 +112,34 @@ pub fn id_from_url(url: &str) -> &str {
     url.trim_end_matches('/').rsplit('/').next().unwrap_or(url)
 }
 
-/// A station as shown in lists (place channel lists, search results).
+/// Where a station comes from, and so how to play it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum StationSource {
+    /// Played via Radio Garden's listen endpoint using `channel_id`.
+    #[default]
+    RadioGarden,
+    /// Played directly from Radio Browser's resolved stream URL.
+    RadioBrowser { uuid: String, stream_url: String },
+}
+
+impl StationSource {
+    pub fn label(&self) -> &'static str {
+        match self {
+            StationSource::RadioGarden => "radio garden",
+            StationSource::RadioBrowser { .. } => "radio browser",
+        }
+    }
+
+    pub fn short(&self) -> &'static str {
+        match self {
+            StationSource::RadioGarden => "RG",
+            StationSource::RadioBrowser { .. } => "RB",
+        }
+    }
+}
+
+/// A station as shown in lists (place channel lists, search results) and
+/// handed to the player.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChannelListItem {
     pub title: String,
@@ -120,6 +147,7 @@ pub struct ChannelListItem {
     pub place: Option<PlaceRef>,
     pub country: Option<CountryRef>,
     pub website: Option<String>,
+    pub source: StationSource,
 }
 
 impl ChannelListItem {
@@ -141,6 +169,7 @@ impl From<&SearchHit> for ChannelListItem {
             place: hit.source.page.place.clone(),
             country: hit.source.page.country.clone(),
             website: None,
+            source: StationSource::RadioGarden,
         }
     }
 }

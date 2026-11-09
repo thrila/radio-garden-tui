@@ -787,6 +787,7 @@ mod tests {
             place: None,
             country: None,
             website: None,
+            source: Default::default(),
         }
     }
 

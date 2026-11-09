@@ -41,6 +41,9 @@ pub struct LiveStream {
 
 pub struct ApiClient {
     client: Client,
+    /// Same settings but never follows redirects: used to read the listen
+    /// endpoint's `Location` header (stream host) without opening the stream.
+    no_redirect: Client,
     last_request: Mutex<Option<Instant>>,
 }
 
@@ -54,8 +57,15 @@ impl ApiClient {
             // but a stalled server is detected.
             .read_timeout(Duration::from_secs(20))
             .build()?;
+        let no_redirect = Client::builder()
+            .user_agent(USER_AGENT)
+            .redirect(redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(JSON_TIMEOUT)
+            .build()?;
         Ok(Self {
             client,
+            no_redirect,
             last_request: Mutex::new(None),
         })
     }
@@ -73,10 +83,23 @@ impl ApiClient {
     }
 
     async fn get_json(&self, path: &str, query: &[(&str, &str)]) -> Result<Value> {
+        self.get_json_with(path, query, true).await
+    }
+
+    /// `paced = false` is for the background index builder, which enforces
+    /// its own concurrency cap and delay instead of the global spacing.
+    async fn get_json_with(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        paced: bool,
+    ) -> Result<Value> {
         let url = format!("{BASE_URL}/{path}");
         let mut attempt = 0;
         loop {
-            self.pace().await;
+            if paced {
+                self.pace().await;
+            }
             let result = self
                 .client
                 .get(&url)
@@ -115,6 +138,33 @@ impl ApiClient {
         Ok(parse_channel_list(&raw["data"]))
     }
 
+    /// Channel list for the background index: not globally paced (the
+    /// caller caps concurrency and waits between requests).
+    pub async fn get_place_channels_for_index(
+        &self,
+        place_id: &str,
+    ) -> Result<Vec<ChannelListItem>> {
+        let raw = self
+            .get_json_with(&format!("ara/content/page/{place_id}/channels"), &[], false)
+            .await?;
+        Ok(parse_channel_list(&raw["data"]))
+    }
+
+    /// Host of the stream a channel redirects to, read from the listen
+    /// endpoint's `Location` header without following it.
+    pub async fn stream_host(&self, channel_id: &str) -> Result<Option<String>> {
+        let resp = self
+            .no_redirect
+            .head(Self::listen_url(channel_id))
+            .send()
+            .await?;
+        Ok(resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::dedupe::stream_host))
+    }
+
     pub async fn search(&self, query: &str) -> Result<Vec<SearchHit>> {
         let raw = self.get_json("search", &[("q", query)]).await?;
         parse_search(&raw)
@@ -127,8 +177,19 @@ impl ApiClient {
     /// Open the live stream for a channel, following the whole redirect
     /// chain (and any .pls/.m3u playlist indirection) to the actual audio.
     pub async fn open_stream(&self, channel_id: &str) -> Result<LiveStream> {
-        let mut url = Self::listen_url(channel_id);
         self.pace().await;
+        self.open_from(Self::listen_url(channel_id), channel_id)
+            .await
+    }
+
+    /// Open a stream by its direct URL (Radio Browser's `url_resolved`),
+    /// with the same redirect, playlist and buffering handling.
+    pub async fn open_url(&self, url: &str) -> Result<LiveStream> {
+        self.open_from(url.to_string(), url).await
+    }
+
+    async fn open_from(&self, start: String, channel_id: &str) -> Result<LiveStream> {
+        let mut url = start;
 
         for _ in 0..MAX_PLAYLIST_HOPS {
             let resp = self.client.get(&url).send().await?;
@@ -310,6 +371,7 @@ pub(crate) fn parse_channel_list(data: &Value) -> Vec<ChannelListItem> {
                 place,
                 country,
                 website: page["website"].as_str().map(str::to_string),
+                source: StationSource::RadioGarden,
             })
         })
         .collect()
