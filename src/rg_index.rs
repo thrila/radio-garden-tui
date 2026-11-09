@@ -17,6 +17,7 @@ use crate::api::{ApiClient, Place};
 use crate::cache::{Cache, IndexedChannel};
 use crate::countries::country_code;
 use crate::dedupe::{DedupeIndex, IndexEntry, normalize};
+use crate::error::RadioError;
 
 /// Requests in flight at once.
 pub const WORKERS: usize = 6;
@@ -96,15 +97,22 @@ fn load_snapshot(cache: &Cache) -> Option<Arc<DedupeIndex>> {
 
 type FetchResult = (PlaceRef, Result<Vec<IndexedChannel>, String>);
 
+fn is_not_found(e: &RadioError) -> bool {
+    matches!(e, RadioError::Http(err) if err.status() == Some(reqwest::StatusCode::NOT_FOUND))
+}
+
 async fn fetch_place(
     api: &ApiClient,
     place: &PlaceRef,
     resolve_hosts: bool,
 ) -> Result<Vec<IndexedChannel>, String> {
-    let channels = api
-        .get_place_channels_for_index(&place.id)
-        .await
-        .map_err(|e| e.to_string())?;
+    let channels = match api.get_place_channels_for_index(&place.id).await {
+        Ok(c) => c,
+        // The place was removed from Radio Garden since our place list was
+        // saved: it has no channels, which is a result, not a failure.
+        Err(e) if is_not_found(&e) => Vec::new(),
+        Err(e) => return Err(e.to_string()),
+    };
     let mut out = Vec::with_capacity(channels.len());
     for c in channels {
         let host = if resolve_hosts {
