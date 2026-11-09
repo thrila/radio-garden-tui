@@ -144,11 +144,11 @@ pub async fn run(
 
     let fresh = cache.index_age().is_some_and(|age| age < MAX_AGE);
     let had_complete = cache.index_age().is_some();
-    if options.force || (had_complete && !fresh) {
-        if let Err(e) = cache.reset_index_progress() {
-            let _ = events.send(IndexEvent::Failed(e.to_string()));
-            return;
-        }
+    if (options.force || (had_complete && !fresh))
+        && let Err(e) = cache.reset_index_progress()
+    {
+        let _ = events.send(IndexEvent::Failed(e.to_string()));
+        return;
     }
 
     // Whatever is already indexed is usable right away.
@@ -206,7 +206,7 @@ pub async fn run(
         if events.is_closed() {
             return;
         }
-        if done % PROGRESS_EVERY == 0 {
+        if done.is_multiple_of(PROGRESS_EVERY) {
             let _ = events.send(IndexEvent::Progress { done, total });
         }
         if since_snapshot >= SNAPSHOT_EVERY {

@@ -4,7 +4,9 @@ use crossterm::event::{self, Event, KeyEvent};
 use tokio::sync::mpsc;
 
 use crate::api::{ChannelListItem, LiveStream, Place, SearchHit};
+use crate::app::BeyondPage;
 use crate::audio::PlayerEvent;
+use crate::rg_index::IndexEvent;
 
 /// Everything the main loop reacts to.
 pub enum AppEvent {
@@ -25,6 +27,11 @@ pub enum AppEvent {
         result: Result<LiveStream, String>,
     },
     Player(PlayerEvent),
+    Beyond {
+        query: String,
+        result: Result<BeyondPage, String>,
+    },
+    Index(IndexEvent),
 }
 
 /// Spawn the terminal input reader on its own OS thread (crossterm polling
