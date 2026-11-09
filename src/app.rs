@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo::{Config, Matcher, Utf32Str};
 
-use crate::api::{ChannelListItem, Place, SearchHit};
+use crate::api::{ChannelListItem, Place, RbStation, SearchHit};
 use crate::audio::{PlayerEvent, PlayerState};
 
 pub const VOLUME_STEP: f32 = 0.05;
@@ -21,6 +21,8 @@ pub enum Screen {
     Stations,
     Search,
     NowPlaying,
+    /// Radio Browser stations that aren't on Radio Garden.
+    Beyond,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +47,59 @@ pub enum Command {
     },
     Stop,
     SetVolume(f32),
+    /// Query Radio Browser and filter out Radio Garden stations.
+    BeyondSearch {
+        query: String,
+    },
+    /// Rebuild the Radio Garden index now, even if it's fresh.
+    RebuildIndex,
+}
+
+/// How a Beyond result list was filtered against Radio Garden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Filtering {
+    /// No Radio Garden index yet: may contain Radio Garden stations.
+    NotFiltered,
+    /// Index still being built: some Radio Garden stations may slip through.
+    Partial,
+    Filtered,
+}
+
+/// One page of Beyond results, already filtered.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BeyondPage {
+    pub stations: Vec<RbStation>,
+    pub hidden: usize,
+    pub collapsed: usize,
+    pub filtering: Filtering,
+}
+
+/// State of the background Radio Garden index.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IndexStatus {
+    pub channels: usize,
+    pub complete: bool,
+    /// `(places done, places total)` while a build runs.
+    pub progress: Option<(usize, usize)>,
+    pub error: Option<String>,
+}
+
+impl IndexStatus {
+    pub fn filtering(&self) -> Filtering {
+        if self.channels == 0 {
+            Filtering::NotFiltered
+        } else if self.complete {
+            Filtering::Filtered
+        } else {
+            Filtering::Partial
+        }
+    }
+
+    pub fn percent(&self) -> Option<usize> {
+        self.progress
+            .map(|(done, total)| done * 100 / total.max(1))
+            .filter(|_| !self.complete || self.progress.is_some_and(|(d, t)| d < t))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -227,6 +282,17 @@ pub struct App {
     pub show_help: bool,
     pub tick: u64,
     seed: u64,
+
+    pub index: IndexStatus,
+    pub beyond_input: String,
+    /// The query the current results are for.
+    pub beyond_query: Option<String>,
+    pub beyond_focus: SearchFocus,
+    pub beyond_results: Vec<RbStation>,
+    pub beyond_state: ListState,
+    pub beyond_hidden: usize,
+    pub beyond_collapsed: usize,
+    pub beyond_filtering: Filtering,
 }
 
 impl Default for App {
@@ -266,6 +332,15 @@ impl App {
             notice: None,
             show_help: false,
             tick: 0,
+            index: IndexStatus::default(),
+            beyond_input: String::new(),
+            beyond_query: None,
+            beyond_focus: SearchFocus::Input,
+            beyond_results: Vec::new(),
+            beyond_state: ListState::default(),
+            beyond_hidden: 0,
+            beyond_collapsed: 0,
+            beyond_filtering: Filtering::NotFiltered,
             seed: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
@@ -295,6 +370,7 @@ impl App {
             &mut self.places_state,
             &mut self.channels_state,
             &mut self.search_state,
+            &mut self.beyond_state,
         ] {
             s.set_page(height);
         }
@@ -306,6 +382,9 @@ impl App {
             Screen::Stations => Some(&mut self.channels_state),
             Screen::Search if self.search_focus == SearchFocus::Results => {
                 Some(&mut self.search_state)
+            }
+            Screen::Beyond if self.beyond_focus == SearchFocus::Results => {
+                Some(&mut self.beyond_state)
             }
             _ => None,
         }
@@ -439,6 +518,65 @@ impl App {
                     self.return_screen
                 };
             }
+            Screen::Beyond => {
+                if self.beyond_focus == SearchFocus::Results {
+                    self.beyond_focus = SearchFocus::Input;
+                } else {
+                    self.screen = Screen::Places;
+                }
+            }
+        }
+    }
+
+    fn beyond_search(&mut self, query: String) -> Command {
+        self.loading = Some(if query.is_empty() {
+            "Asking Radio Browser".to_string()
+        } else {
+            format!("Asking Radio Browser for \"{query}\"")
+        });
+        self.beyond_query = Some(query.clone());
+        Command::BeyondSearch { query }
+    }
+
+    fn enter_beyond(&mut self) -> Option<Command> {
+        if self.screen != Screen::Beyond {
+            self.return_screen = self.screen;
+        }
+        self.screen = Screen::Beyond;
+        if self.beyond_query.is_none() {
+            // First visit: show the most-voted stations right away.
+            self.beyond_focus = SearchFocus::Input;
+            return Some(self.beyond_search(String::new()));
+        }
+        if !self.beyond_results.is_empty() {
+            self.beyond_focus = SearchFocus::Results;
+        }
+        None
+    }
+
+    fn handle_beyond_input(&mut self, key: KeyEvent) -> Option<Command> {
+        match key.code {
+            KeyCode::Esc => {
+                self.go_back();
+                None
+            }
+            KeyCode::Enter => {
+                let query = self.beyond_input.trim().to_string();
+                Some(self.beyond_search(query))
+            }
+            KeyCode::Down | KeyCode::Tab if !self.beyond_results.is_empty() => {
+                self.beyond_focus = SearchFocus::Results;
+                None
+            }
+            KeyCode::Backspace => {
+                self.beyond_input.pop();
+                None
+            }
+            KeyCode::Char(c) => {
+                self.beyond_input.push(c);
+                None
+            }
+            _ => None,
         }
     }
 
@@ -461,6 +599,22 @@ impl App {
 
         if self.screen == Screen::Search && self.search_focus == SearchFocus::Input {
             return self.handle_search_input(key);
+        }
+        if self.screen == Screen::Beyond {
+            if self.beyond_focus == SearchFocus::Input {
+                return self.handle_beyond_input(key);
+            }
+            match key.code {
+                KeyCode::Char('/') => {
+                    self.beyond_focus = SearchFocus::Input;
+                    return None;
+                }
+                KeyCode::Char('I') => {
+                    self.index.error = None;
+                    return Some(Command::RebuildIndex);
+                }
+                _ => {}
+            }
         }
 
         // Navigation shared by all list screens.
@@ -512,6 +666,7 @@ impl App {
                 self.search_focus = SearchFocus::Input;
                 None
             }
+            KeyCode::Char('b') => self.enter_beyond(),
             KeyCode::Char('n') if self.now_playing.is_some() => {
                 if self.screen != Screen::NowPlaying {
                     self.return_screen = self.screen;
@@ -575,12 +730,25 @@ impl App {
                 SearchItem::Place(p) => Some(self.open_place(p)),
                 SearchItem::Station(s) => Some(self.play(s)),
             },
+            Screen::Beyond => {
+                let station = self
+                    .beyond_results
+                    .get(self.beyond_state.selected)?
+                    .to_station();
+                Some(self.play(station))
+            }
             Screen::NowPlaying => None,
         }
     }
 
     fn random_pick(&mut self) -> Option<Command> {
         match self.screen {
+            Screen::Beyond if !self.beyond_results.is_empty() => {
+                let i = self.random(self.beyond_results.len());
+                self.beyond_state.select_index(i);
+                let station = self.beyond_results[i].to_station();
+                Some(self.play(station))
+            }
             Screen::Stations if !self.channels.is_empty() => {
                 let i = self.random(self.channels.len());
                 self.channels_state.select_index(i);
@@ -630,6 +798,50 @@ impl App {
             }
             Err(e) => self.notice = Some(Notice::Error(format!("Couldn't load stations: {e}"))),
         }
+    }
+
+    pub fn on_beyond(&mut self, query: &str, result: Result<BeyondPage, String>) {
+        if self.beyond_query.as_deref() != Some(query) {
+            return; // stale
+        }
+        self.loading = None;
+        match result {
+            Ok(page) => {
+                self.beyond_results = page.stations;
+                self.beyond_hidden = page.hidden;
+                self.beyond_collapsed = page.collapsed;
+                self.beyond_filtering = page.filtering;
+                self.beyond_state.reset(self.beyond_results.len());
+                if self.beyond_results.is_empty() {
+                    self.notice = Some(Notice::Info("Nothing beyond Radio Garden for that".into()));
+                } else if self.screen == Screen::Beyond {
+                    self.beyond_focus = SearchFocus::Results;
+                }
+            }
+            Err(e) => self.notice = Some(Notice::Error(format!("Radio Browser: {e}"))),
+        }
+    }
+
+    pub fn on_index_progress(&mut self, done: usize, total: usize) {
+        self.index.progress = Some((done, total));
+    }
+
+    /// A new matching snapshot is in use. If the Beyond list on screen was
+    /// filtered with less than this, re-run it.
+    pub fn on_index_snapshot(&mut self, channels: usize, complete: bool) -> Option<Command> {
+        self.index.channels = channels;
+        self.index.complete = complete;
+        let better = self.index.filtering() == Filtering::Filtered
+            && self.beyond_filtering != Filtering::Filtered;
+        if better && self.screen == Screen::Beyond && self.loading.is_none() {
+            let query = self.beyond_query.clone()?;
+            return Some(self.beyond_search(query));
+        }
+        None
+    }
+
+    pub fn on_index_error(&mut self, error: String) {
+        self.index.error = Some(error);
     }
 
     pub fn on_search(&mut self, query: &str, result: Result<Vec<SearchHit>, String>) {
@@ -1145,6 +1357,127 @@ mod tests {
         assert_eq!(app.search_focus, SearchFocus::Input);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen, Screen::Places);
+    }
+
+    fn rb_fixture() -> Vec<RbStation> {
+        let raw = std::fs::read_to_string("tests/fixtures/rb_stations.json").unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    fn page(filtering: Filtering) -> BeyondPage {
+        BeyondPage {
+            stations: rb_fixture(),
+            hidden: 3,
+            collapsed: 1,
+            filtering,
+        }
+    }
+
+    #[test]
+    fn b_opens_beyond_and_fetches_top_stations_once() {
+        let mut app = app_with_places();
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('b'))),
+            Some(Command::BeyondSearch {
+                query: String::new()
+            })
+        );
+        assert_eq!(app.screen, Screen::Beyond);
+        app.on_beyond("", Ok(page(Filtering::Filtered)));
+        assert_eq!(app.beyond_results.len(), 4);
+        assert_eq!(app.beyond_focus, SearchFocus::Results);
+
+        app.handle_key(key(KeyCode::Esc)); // results -> input
+        app.handle_key(key(KeyCode::Esc)); // input -> places
+        assert_eq!(app.screen, Screen::Places);
+        assert_eq!(app.handle_key(key(KeyCode::Char('b'))), None, "no refetch");
+    }
+
+    #[test]
+    fn beyond_typing_and_enter_searches() {
+        let mut app = app_with_places();
+        app.handle_key(key(KeyCode::Char('b')));
+        for c in "jazz cc:NG".chars() {
+            assert_eq!(
+                app.handle_key(key(KeyCode::Char(c))),
+                None,
+                "typing is text"
+            );
+        }
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Some(Command::BeyondSearch {
+                query: "jazz cc:NG".into()
+            })
+        );
+        // The first (empty) query's late answer is ignored.
+        app.on_beyond("", Ok(page(Filtering::Filtered)));
+        assert!(app.beyond_results.is_empty());
+    }
+
+    #[test]
+    fn enter_on_beyond_result_plays_radio_browser_stream() {
+        let mut app = app_with_places();
+        app.handle_key(key(KeyCode::Char('b')));
+        app.on_beyond("", Ok(page(Filtering::Filtered)));
+        match app.handle_key(key(KeyCode::Enter)) {
+            Some(Command::Play { station, .. }) => assert!(matches!(
+                station.source,
+                crate::api::StationSource::RadioBrowser { .. }
+            )),
+            other => panic!("expected Play, got {other:?}"),
+        }
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Beyond, "back returns to Beyond");
+    }
+
+    #[test]
+    fn finished_index_refilters_unfiltered_results() {
+        let mut app = app_with_places();
+        app.handle_key(key(KeyCode::Char('b')));
+        app.on_beyond("", Ok(page(Filtering::NotFiltered)));
+        assert_eq!(
+            app.on_index_snapshot(500, false),
+            None,
+            "partial isn't better enough"
+        );
+        assert_eq!(
+            app.on_index_snapshot(40_000, true),
+            Some(Command::BeyondSearch {
+                query: String::new()
+            })
+        );
+        app.on_beyond("", Ok(page(Filtering::Filtered)));
+        assert_eq!(
+            app.on_index_snapshot(40_001, true),
+            None,
+            "already filtered"
+        );
+    }
+
+    #[test]
+    fn index_status_reports_filtering_and_progress() {
+        let mut s = IndexStatus::default();
+        assert_eq!(s.filtering(), Filtering::NotFiltered);
+        s.channels = 10;
+        assert_eq!(s.filtering(), Filtering::Partial);
+        s.progress = Some((50, 200));
+        assert_eq!(s.percent(), Some(25));
+        s.complete = true;
+        assert_eq!(s.filtering(), Filtering::Filtered);
+        s.progress = Some((200, 200));
+        assert_eq!(s.percent(), None, "nothing to show once done");
+    }
+
+    #[test]
+    fn capital_i_requests_index_rebuild_from_results() {
+        let mut app = app_with_places();
+        app.handle_key(key(KeyCode::Char('b')));
+        app.on_beyond("", Ok(page(Filtering::Filtered)));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('I'))),
+            Some(Command::RebuildIndex)
+        );
     }
 
     #[test]
